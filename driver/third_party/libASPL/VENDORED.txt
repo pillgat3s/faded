@@ -1,0 +1,2 @@
+libASPL 633e0f70203edd87d320fc5a3cae901e1363aac5 (2025-04-14, post-v3.1.2), MIT. Vendored without tests/docs/examples.
+Patched CMakeLists.txt: default GIT_TAG=3.1.2 when no .git present (vendored).

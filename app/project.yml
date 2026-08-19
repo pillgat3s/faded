@@ -1,0 +1,58 @@
+name: Fader
+options:
+  bundleIdPrefix: com.andri
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    # Same stable identity as SafeKey: an ad-hoc signature changes every build,
+    # which resets TCC grants and (for us) the "Fader" login item registration.
+    CODE_SIGN_IDENTITY: "Apple Development: thomannandri@gmail.com (R6QBGGCUGC)"
+    CODE_SIGN_STYLE: Manual
+    ENABLE_HARDENED_RUNTIME: NO
+    DEAD_CODE_STRIPPING: YES
+    GENERATE_INFOPLIST_FILE: YES
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: NO
+targets:
+  Fader:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/Fader
+      # The HAL driver bundle built by `make driver`; copied into
+      # Fader.app/Contents/Resources so the app can install it.
+      - path: ../driver/build/FaderDriver.driver
+        type: folder
+        buildPhase: resources
+        optional: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.andri.fader
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Custom properties on the driver + AppleScript admin prompt need no
+        # sandbox; keep the app un-sandboxed (personal tool).
+        ENABLE_APP_SANDBOX: NO
+    info:
+      path: Sources/Fader/Info.plist
+      properties:
+        CFBundleDisplayName: Fader
+        CFBundleName: Fader
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSApplicationCategoryType: public.app-category.utilities
+        LSUIElement: true
+        LSMinimumSystemVersion: "26.0"
+        NSHumanReadableCopyright: ""
+        NSSupportsSuddenTermination: false
+        NSAppleEventsUsageDescription: "Fader uses an administrator prompt to install its audio driver."
+schemes:
+  Fader:
+    build:
+      targets:
+        Fader: all
+    run:
+      config: Debug

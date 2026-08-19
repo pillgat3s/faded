@@ -1,0 +1,10 @@
+# build outputs
+build/
+driver/build/
+app/build/
+app/Fader.xcodeproj/
+# xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+.DS_Store

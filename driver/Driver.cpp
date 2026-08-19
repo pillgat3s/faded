@@ -1,0 +1,526 @@
+// FaderDriver — CoreAudio AudioServerPlugIn (HAL driver) for Fader.app.
+//
+// Two virtual devices in one plug-in:
+//
+//   "Fader"      visible OUTPUT device. Apps play into it. It exposes a real
+//                volume + mute control, so macOS's Sound slider, the menu bar
+//                sound item and the F11/F12 keys all "just work" on it — that
+//                is what makes hardware-volume-less devices (Astro A50 base
+//                station, most USB DACs, HDMI) controllable from the keyboard.
+//
+//   "Fader Tap"  HIDDEN input device. Fader.app reads the mixed, processed
+//                output back from it and plays it to the real target device
+//                (built-in speakers, AirPods, Astro, AirPlay…). Hidden means
+//                Discord/Zoom/etc. never see a fake microphone.
+//
+// Processing chain per I/O cycle on the Fader device (all real-time thread):
+//
+//   client A ─┐  OnProcessClientOutput: × per-app gain, peak meter
+//   client B ─┼─► libASPL mixes ─► OnProcessMixedOutput: × master vol / mute
+//   client C ─┘                     (unless bypassed) ─► OnWriteMixedOutput ─► FIFO
+//
+//   Fader Tap: OnReadClientInput ◄─ FIFO
+//
+// App <-> driver control goes through custom properties on the Fader device
+// (see FaderProtocol.h). Built on libASPL (MIT) which handles the enormous
+// AudioServerPlugIn boilerplate; this file is only the Fader-specific logic.
+
+#include <aspl/Driver.hpp>
+
+#include <CoreAudio/AudioServerPlugIn.h>
+#include <CoreFoundation/CoreFoundation.h>
+
+#include <atomic>
+#include <cmath>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "FaderFIFO.hpp"
+#include "FaderProtocol.h"
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Small CF helpers
+// ---------------------------------------------------------------------------
+
+CFStringRef makeCFString(const std::string& s)
+{
+    return CFStringCreateWithCString(kCFAllocatorDefault, s.c_str(), kCFStringEncodingUTF8);
+}
+
+std::string toStdString(CFStringRef s)
+{
+    if (!s) {
+        return {};
+    }
+    if (const char* fast = CFStringGetCStringPtr(s, kCFStringEncodingUTF8)) {
+        return fast;
+    }
+    const CFIndex len = CFStringGetMaximumSizeForEncoding(CFStringGetLength(s), kCFStringEncodingUTF8) + 1;
+    std::string out(static_cast<size_t>(len), '\0');
+    if (CFStringGetCString(s, out.data(), len, kCFStringEncodingUTF8)) {
+        out.resize(std::strlen(out.c_str()));
+        return out;
+    }
+    return {};
+}
+
+CFNumberRef makeCFNumber(double v)
+{
+    return CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &v);
+}
+
+CFNumberRef makeCFNumber(long long v)
+{
+    return CFNumberCreate(kCFAllocatorDefault, kCFNumberLongLongType, &v);
+}
+
+void dictSet(CFMutableDictionaryRef d, const char* key, CFTypeRef value /* consumed */)
+{
+    CFStringRef k = CFStringCreateWithCString(kCFAllocatorDefault, key, kCFStringEncodingUTF8);
+    CFDictionarySetValue(d, k, value);
+    CFRelease(k);
+    CFRelease(value);
+}
+
+// ---------------------------------------------------------------------------
+// Audio format
+// ---------------------------------------------------------------------------
+
+AudioStreamBasicDescription floatFormat(Float64 rate)
+{
+    AudioStreamBasicDescription f = {};
+    f.mSampleRate = rate;
+    f.mFormatID = kAudioFormatLinearPCM;
+    f.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked;
+    f.mBitsPerChannel = 32;
+    f.mChannelsPerFrame = kFaderChannelCount;
+    f.mBytesPerFrame = sizeof(Float32) * kFaderChannelCount;
+    f.mFramesPerPacket = 1;
+    f.mBytesPerPacket = f.mBytesPerFrame;
+    return f;
+}
+
+std::vector<AudioValueRange> supportedRates()
+{
+    auto r = [](double v) { return AudioValueRange{v, v}; };
+    return {r(kFaderSampleRate44k), r(kFaderSampleRate48k), r(kFaderSampleRate88k), r(kFaderSampleRate96k)};
+}
+
+// ---------------------------------------------------------------------------
+// Per-client state
+// ---------------------------------------------------------------------------
+
+class FaderClient : public aspl::Client {
+public:
+    explicit FaderClient(const aspl::ClientInfo& info)
+        : aspl::Client(info)
+    {
+        key_ = info.BundleID.empty() ? ("pid:" + std::to_string(info.ProcessID)) : info.BundleID;
+    }
+
+    const std::string& key() const { return key_; }
+
+    std::atomic<float> gain{1.0f};  // written on control thread, read on RT thread
+    std::atomic<float> peak{0.0f};  // written on RT thread, read on control thread
+
+private:
+    std::string key_;
+};
+
+// ---------------------------------------------------------------------------
+// The Fader output device
+// ---------------------------------------------------------------------------
+
+class FaderOutputDevice;
+
+class OutputHandler : public aspl::ControlRequestHandler, public aspl::IORequestHandler {
+public:
+    void attach(std::weak_ptr<FaderOutputDevice> device) { device_ = std::move(device); }
+
+    // -- clients (control thread) --------------------------------------
+
+    std::shared_ptr<aspl::Client> OnAddClient(const aspl::ClientInfo& info) override;
+    void OnRemoveClient(std::shared_ptr<aspl::Client> client) override;
+
+    // -- I/O lifecycle (control thread) ---------------------------------
+
+    OSStatus OnStartIO() override
+    {
+        fader::FIFO::shared().reset();
+        running_.store(true, std::memory_order_relaxed);
+        return kAudioHardwareNoError;
+    }
+
+    void OnStopIO() override { running_.store(false, std::memory_order_relaxed); }
+
+    // -- I/O (real-time thread) -----------------------------------------
+
+    void OnProcessClientOutput(const std::shared_ptr<aspl::Client>& client,
+        const std::shared_ptr<aspl::Stream>& /*stream*/,
+        Float64 /*zeroTimestamp*/,
+        Float64 /*timestamp*/,
+        Float32* frames,
+        UInt32 frameCount,
+        UInt32 channelCount) override
+    {
+        auto* fc = static_cast<FaderClient*>(client.get());
+        const float gain = fc->gain.load(std::memory_order_relaxed);
+        const UInt32 n = frameCount * channelCount;
+
+        float peak = 0.0f;
+        if (gain == 1.0f) {
+            for (UInt32 i = 0; i < n; ++i) {
+                const float a = std::fabs(frames[i]);
+                peak = a > peak ? a : peak;
+            }
+        } else {
+            for (UInt32 i = 0; i < n; ++i) {
+                frames[i] *= gain;
+                const float a = std::fabs(frames[i]);
+                peak = a > peak ? a : peak;
+            }
+        }
+        // Decaying peak-hold: fast attack, ~0.9× per cycle release.
+        const float prev = fc->peak.load(std::memory_order_relaxed) * 0.9f;
+        fc->peak.store(peak > prev ? peak : prev, std::memory_order_relaxed);
+    }
+
+    void OnProcessMixedOutput(const std::shared_ptr<aspl::Stream>& stream,
+        Float64 /*zeroTimestamp*/,
+        Float64 /*timestamp*/,
+        Float32* frames,
+        UInt32 frameCount,
+        UInt32 channelCount) override
+    {
+        // When bypassed, Fader.app mirrors the volume/mute controls onto the
+        // real device's hardware gain instead, so we must NOT attenuate here.
+        if (!bypassMaster.load(std::memory_order_relaxed)) {
+            stream->ApplyProcessing(frames, frameCount, channelCount);
+        }
+    }
+
+    void OnWriteMixedOutput(const std::shared_ptr<aspl::Stream>& /*stream*/,
+        Float64 /*zeroTimestamp*/,
+        Float64 /*timestamp*/,
+        const void* bytes,
+        UInt32 bytesCount) override
+    {
+        fader::FIFO::shared().write(static_cast<const float*>(bytes),
+            bytesCount / (sizeof(Float32) * kFaderChannelCount));
+    }
+
+    // -- app-facing state ---------------------------------------------
+
+    std::atomic<bool> bypassMaster{false};
+    bool isRunning() const { return running_.load(std::memory_order_relaxed); }
+
+    // Per-app gains keyed by bundle id (or "pid:N"). Control thread only.
+    std::mutex gainsMutex;
+    std::map<std::string, float> gains;
+
+private:
+    std::weak_ptr<FaderOutputDevice> device_;
+    std::atomic<bool> running_{false};
+};
+
+class FaderOutputDevice : public aspl::Device {
+public:
+    FaderOutputDevice(std::shared_ptr<const aspl::Context> context,
+        const aspl::DeviceParameters& params,
+        std::shared_ptr<OutputHandler> handler)
+        : aspl::Device(std::move(context), params)
+        , handler_(std::move(handler))
+    {
+        SetControlHandler(handler_);
+        SetIOHandler(handler_);
+
+        RegisterCustomProperty(kFaderProp_Version,
+            [] { return makeCFString(kFaderProtocolVersion); });
+
+        RegisterCustomProperty(kFaderProp_Clients,
+            std::function<CFPropertyListRef()>([this] { return copyClientList(); }),
+            std::function<void(CFPropertyListRef)>{});
+
+        RegisterCustomProperty(kFaderProp_AppGains,
+            std::function<CFPropertyListRef()>([this] { return copyAppGains(); }),
+            std::function<void(CFPropertyListRef)>([this](CFPropertyListRef v) { setAppGains(v); }));
+
+        RegisterCustomProperty(kFaderProp_BypassMaster,
+            std::function<CFPropertyListRef()>([this] {
+                CFBooleanRef b = handler_->bypassMaster.load() ? kCFBooleanTrue : kCFBooleanFalse;
+                CFRetain(b);
+                return static_cast<CFPropertyListRef>(b);
+            }),
+            std::function<void(CFPropertyListRef)>([this](CFPropertyListRef v) {
+                if (v && CFGetTypeID(v) == CFBooleanGetTypeID()) {
+                    handler_->bypassMaster.store(CFBooleanGetValue(static_cast<CFBooleanRef>(v)));
+                    NotifyPropertyChanged(kFaderProp_BypassMaster);
+                }
+            }));
+
+        RegisterCustomProperty(kFaderProp_HideOutput,
+            std::function<CFPropertyListRef()>([this] {
+                CFBooleanRef b = GetIsHidden() ? kCFBooleanTrue : kCFBooleanFalse;
+                CFRetain(b);
+                return static_cast<CFPropertyListRef>(b);
+            }),
+            std::function<void(CFPropertyListRef)>([this](CFPropertyListRef v) {
+                if (v && CFGetTypeID(v) == CFBooleanGetTypeID()) {
+                    SetIsHidden(CFBooleanGetValue(static_cast<CFBooleanRef>(v)));
+                    NotifyPropertyChanged(kFaderProp_HideOutput);
+                }
+            }));
+
+        RegisterCustomProperty(kFaderProp_Stats,
+            std::function<CFPropertyListRef()>([this] { return copyStats(); }),
+            std::function<void(CFPropertyListRef)>{});
+    }
+
+    // Called by the handler when clients come and go.
+    void clientsChanged() { NotifyPropertyChanged(kFaderProp_Clients); }
+
+    // Look up the stored gain for a client key (control thread).
+    float gainFor(const std::string& key)
+    {
+        std::lock_guard<std::mutex> lock(handler_->gainsMutex);
+        auto it = handler_->gains.find(key);
+        return it == handler_->gains.end() ? 1.0f : it->second;
+    }
+
+    void setTapRunning(std::atomic<bool>* flag) { tapRunning_ = flag; }
+
+private:
+    CFPropertyListRef copyClientList()
+    {
+        CFMutableArrayRef arr = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+        for (const auto& c : GetClients()) {
+            auto* fc = static_cast<FaderClient*>(c.get());
+            CFMutableDictionaryRef d = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            dictSet(d, "pid", makeCFNumber(static_cast<long long>(fc->GetProcessID())));
+            dictSet(d, "client", makeCFNumber(static_cast<long long>(fc->GetClientID())));
+            dictSet(d, "bundle", makeCFString(fc->GetBundleID()));
+            dictSet(d, "key", makeCFString(fc->key()));
+            dictSet(d, "gain", makeCFNumber(static_cast<double>(fc->gain.load())));
+            dictSet(d, "peak", makeCFNumber(static_cast<double>(fc->peak.load())));
+            CFArrayAppendValue(arr, d);
+            CFRelease(d);
+        }
+        return arr;
+    }
+
+    CFPropertyListRef copyAppGains()
+    {
+        CFMutableDictionaryRef d = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        std::lock_guard<std::mutex> lock(handler_->gainsMutex);
+        for (const auto& [key, gain] : handler_->gains) {
+            CFStringRef k = makeCFString(key);
+            CFNumberRef v = makeCFNumber(static_cast<double>(gain));
+            CFDictionarySetValue(d, k, v);
+            CFRelease(k);
+            CFRelease(v);
+        }
+        return d;
+    }
+
+    void setAppGains(CFPropertyListRef value)
+    {
+        if (!value || CFGetTypeID(value) != CFDictionaryGetTypeID()) {
+            return;
+        }
+        auto dict = static_cast<CFDictionaryRef>(value);
+        std::map<std::string, float> next;
+
+        const CFIndex n = CFDictionaryGetCount(dict);
+        std::vector<const void*> keys(static_cast<size_t>(n)), vals(static_cast<size_t>(n));
+        CFDictionaryGetKeysAndValues(dict, keys.data(), vals.data());
+        for (CFIndex i = 0; i < n; ++i) {
+            auto k = static_cast<CFTypeRef>(keys[static_cast<size_t>(i)]);
+            auto v = static_cast<CFTypeRef>(vals[static_cast<size_t>(i)]);
+            if (CFGetTypeID(k) != CFStringGetTypeID() || CFGetTypeID(v) != CFNumberGetTypeID()) {
+                continue;
+            }
+            double g = 1.0;
+            CFNumberGetValue(static_cast<CFNumberRef>(v), kCFNumberDoubleType, &g);
+            g = std::fmax(0.0, std::fmin(2.0, g));
+            next[toStdString(static_cast<CFStringRef>(k))] = static_cast<float>(g);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(handler_->gainsMutex);
+            handler_->gains = std::move(next);
+        }
+        // Push onto live clients.
+        for (const auto& c : GetClients()) {
+            auto* fc = static_cast<FaderClient*>(c.get());
+            fc->gain.store(gainFor(fc->key()), std::memory_order_relaxed);
+        }
+        NotifyPropertyChanged(kFaderProp_AppGains);
+    }
+
+    CFPropertyListRef copyStats()
+    {
+        auto& fifo = fader::FIFO::shared();
+        CFMutableDictionaryRef d = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        dictSet(d, "fifoFrames", makeCFNumber(static_cast<long long>(fifo.availableFrames())));
+        dictSet(d, "underruns", makeCFNumber(static_cast<long long>(fifo.underruns())));
+        dictSet(d, "overruns", makeCFNumber(static_cast<long long>(fifo.overruns())));
+        dictSet(d, "trims", makeCFNumber(static_cast<long long>(fifo.trims())));
+        dictSet(d, "sampleRate", makeCFNumber(GetNominalSampleRate()));
+        dictSet(d, "clients", makeCFNumber(static_cast<long long>(GetClientCount())));
+        CFBooleanRef out = handler_->isRunning() ? kCFBooleanTrue : kCFBooleanFalse;
+        CFRetain(out);
+        dictSet(d, "outputRunning", out);
+        CFBooleanRef tap = (tapRunning_ && tapRunning_->load()) ? kCFBooleanTrue : kCFBooleanFalse;
+        CFRetain(tap);
+        dictSet(d, "tapRunning", tap);
+        return d;
+    }
+
+    std::shared_ptr<OutputHandler> handler_;
+    std::atomic<bool>* tapRunning_ = nullptr;
+};
+
+std::shared_ptr<aspl::Client> OutputHandler::OnAddClient(const aspl::ClientInfo& info)
+{
+    auto client = std::make_shared<FaderClient>(info);
+    if (auto dev = device_.lock()) {
+        client->gain.store(dev->gainFor(client->key()), std::memory_order_relaxed);
+        dev->clientsChanged();
+    }
+    return client;
+}
+
+void OutputHandler::OnRemoveClient(std::shared_ptr<aspl::Client> /*client*/)
+{
+    if (auto dev = device_.lock()) {
+        dev->clientsChanged();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The hidden Tap input device
+// ---------------------------------------------------------------------------
+
+class TapHandler : public aspl::ControlRequestHandler, public aspl::IORequestHandler {
+public:
+    OSStatus OnStartIO() override
+    {
+        running.store(true, std::memory_order_relaxed);
+        return kAudioHardwareNoError;
+    }
+    void OnStopIO() override { running.store(false, std::memory_order_relaxed); }
+
+    void OnReadClientInput(const std::shared_ptr<aspl::Client>& /*client*/,
+        const std::shared_ptr<aspl::Stream>& /*stream*/,
+        Float64 /*zeroTimestamp*/,
+        Float64 /*timestamp*/,
+        void* bytes,
+        UInt32 bytesCount) override
+    {
+        fader::FIFO::shared().read(static_cast<float*>(bytes),
+            bytesCount / (sizeof(Float32) * kFaderChannelCount));
+    }
+
+    std::atomic<bool> running{false};
+};
+
+// ---------------------------------------------------------------------------
+// Assembly
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<aspl::Driver> CreateFaderDriver()
+{
+#ifdef FADER_DEBUG_TRACE
+    auto tracer = std::make_shared<aspl::Tracer>(aspl::Tracer::Mode::Syslog, aspl::Tracer::Style::Flat);
+#else
+    auto tracer = std::make_shared<aspl::Tracer>(aspl::Tracer::Mode::Noop);
+#endif
+    auto context = std::make_shared<aspl::Context>(tracer);
+
+    // ---- Fader (output) ----
+    aspl::DeviceParameters outParams;
+    outParams.Name = kFaderOutputDeviceName;
+    outParams.Manufacturer = kFaderManufacturer;
+    outParams.DeviceUID = kFaderOutputDeviceUID;
+    outParams.ModelUID = kFaderModelUID;
+    outParams.ConfigurationApplicationBundleID = kFaderAppBundleID;
+    outParams.CanBeDefault = true;
+    outParams.CanBeDefaultForSystemSounds = true;
+    outParams.SampleRate = kFaderDefaultSampleRate;
+    outParams.ChannelCount = kFaderChannelCount;
+    outParams.EnableMixing = true;
+    // Report a small, honest latency so apps' A/V sync accounts for the hop
+    // through the app. Real total ≈ FIFO prime + two AUHAL buffers.
+    outParams.Latency = 512;
+    outParams.SafetyOffset = 64;
+    outParams.ZeroTimeStampPeriod = 512;
+
+    auto outHandler = std::make_shared<OutputHandler>();
+    auto outDevice = std::make_shared<FaderOutputDevice>(context, outParams, outHandler);
+    outHandler->attach(outDevice);
+
+    aspl::StreamParameters outStream;
+    outStream.Direction = aspl::Direction::Output;
+    outStream.Format = floatFormat(kFaderDefaultSampleRate);
+    outDevice->AddStreamWithControlsAsync(outStream); // stream + volume + mute
+    outDevice->SetAvailableSampleRatesAsync(supportedRates());
+
+    // ---- Fader Tap (input, hidden) ----
+    aspl::DeviceParameters tapParams;
+    tapParams.Name = kFaderTapDeviceName;
+    tapParams.Manufacturer = kFaderManufacturer;
+    tapParams.DeviceUID = kFaderTapDeviceUID;
+    tapParams.ModelUID = kFaderModelUID;
+    tapParams.CanBeDefault = false;
+    tapParams.CanBeDefaultForSystemSounds = false;
+    tapParams.SampleRate = kFaderDefaultSampleRate;
+    tapParams.ChannelCount = kFaderChannelCount;
+    tapParams.EnableMixing = false;
+    tapParams.SafetyOffset = 64;
+    tapParams.ZeroTimeStampPeriod = 512;
+
+    auto tapHandler = std::make_shared<TapHandler>();
+    auto tapDevice = std::make_shared<aspl::Device>(context, tapParams);
+    tapDevice->SetControlHandler(tapHandler);
+    tapDevice->SetIOHandler(tapHandler);
+
+    aspl::StreamParameters tapStream;
+    tapStream.Direction = aspl::Direction::Input;
+    tapStream.Format = floatFormat(kFaderDefaultSampleRate);
+    tapDevice->AddStreamAsync(tapStream);
+    tapDevice->SetAvailableSampleRatesAsync(supportedRates());
+#ifndef FADER_TAP_VISIBLE
+    tapDevice->SetIsHidden(true);
+#endif
+
+    outDevice->setTapRunning(&tapHandler->running);
+
+    // ---- plug-in ----
+    aspl::PluginParameters pluginParams;
+    pluginParams.Manufacturer = kFaderManufacturer;
+    pluginParams.ResourceBundlePath = "";
+    auto plugin = std::make_shared<aspl::Plugin>(context, pluginParams);
+    plugin->AddDevice(outDevice);
+    plugin->AddDevice(tapDevice);
+
+    return std::make_shared<aspl::Driver>(context, plugin);
+}
+
+} // namespace
+
+extern "C" __attribute__((visibility("default"))) void* FaderDriverEntryPoint(CFAllocatorRef /*allocator*/, CFUUIDRef typeUUID)
+{
+    if (!CFEqual(typeUUID, kAudioServerPlugInTypeUUID)) {
+        return nullptr;
+    }
+    static std::shared_ptr<aspl::Driver> driver = CreateFaderDriver();
+    return driver->GetReference();
+}
