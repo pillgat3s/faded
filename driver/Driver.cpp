@@ -156,7 +156,12 @@ public:
         return kAudioHardwareNoError;
     }
 
-    void OnStopIO() override { running_.store(false, std::memory_order_relaxed); }
+    void OnStopIO() override
+    {
+        running_.store(false, std::memory_order_relaxed);
+        masterPeakL.store(0.0f, std::memory_order_relaxed);
+        masterPeakR.store(0.0f, std::memory_order_relaxed);
+    }
 
     // -- I/O (real-time thread) -----------------------------------------
 
@@ -210,14 +215,33 @@ public:
         const void* bytes,
         UInt32 bytesCount) override
     {
-        faded::FIFO::shared().write(static_cast<const float*>(bytes),
-            bytesCount / (sizeof(Float32) * kFadedChannelCount));
+        const auto* frames = static_cast<const Float32*>(bytes);
+        const UInt32 frameCount = bytesCount / (sizeof(Float32) * kFadedChannelCount);
+
+        float pl = 0.0f, pr = 0.0f;
+        for (UInt32 i = 0; i < frameCount; ++i) {
+            const float l = std::fabs(frames[i * 2]);
+            const float r = std::fabs(frames[i * 2 + 1]);
+            pl = l > pl ? l : pl;
+            pr = r > pr ? r : pr;
+        }
+        const float prevL = masterPeakL.load(std::memory_order_relaxed) * 0.85f;
+        const float prevR = masterPeakR.load(std::memory_order_relaxed) * 0.85f;
+        masterPeakL.store(pl > prevL ? pl : prevL, std::memory_order_relaxed);
+        masterPeakR.store(pr > prevR ? pr : prevR, std::memory_order_relaxed);
+
+        faded::FIFO::shared().write(frames, frameCount);
     }
 
     // -- app-facing state ---------------------------------------------
 
     std::atomic<bool> bypassMaster{false};
     bool isRunning() const { return running_.load(std::memory_order_relaxed); }
+
+    // Master output meter, written on the RT thread, read by the app via
+    // kFadedProp_Stats. Decaying peak-hold, same shape as the per-client one.
+    std::atomic<float> masterPeakL{0.0f};
+    std::atomic<float> masterPeakR{0.0f};
 
     // Per-app gains keyed by bundle id (or "pid:N"). Control thread only.
     std::mutex gainsMutex;
@@ -348,7 +372,7 @@ private:
             }
             double g = 1.0;
             CFNumberGetValue(static_cast<CFNumberRef>(v), kCFNumberDoubleType, &g);
-            g = std::fmax(0.0, std::fmin(2.0, g));
+            g = std::fmax(0.0, std::fmin(1.0, g));
             next[toStdString(static_cast<CFStringRef>(k))] = static_cast<float>(g);
         }
 
@@ -375,6 +399,8 @@ private:
         dictSet(d, "trims", makeCFNumber(static_cast<long long>(fifo.trims())));
         dictSet(d, "sampleRate", makeCFNumber(GetNominalSampleRate()));
         dictSet(d, "clients", makeCFNumber(static_cast<long long>(GetClientCount())));
+        dictSet(d, "peakL", makeCFNumber(static_cast<double>(handler_->masterPeakL.load())));
+        dictSet(d, "peakR", makeCFNumber(static_cast<double>(handler_->masterPeakR.load())));
         CFBooleanRef out = handler_->isRunning() ? kCFBooleanTrue : kCFBooleanFalse;
         CFRetain(out);
         dictSet(d, "outputRunning", out);

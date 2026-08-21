@@ -70,7 +70,8 @@ extern "C" {
 #define kFadedProp_Clients          'fcli'
 
 // 'fapv' — READ/WRITE, CFPropertyList (CFDictionary bundleID -> CFNumber gain)
-//   Per-app gain, keyed by bundle id. Range 0.0 … 2.0 (1.0 = unity, >1 boost).
+//   Per-app gain, keyed by bundle id. Range 0.0 … 1.0 (1.0 = unity).
+//   No boost — attenuation only, so nothing can clip.
 //   Missing key == 1.0. Applies to current AND future clients with that
 //   bundle id. Setting replaces the whole map (send the full dictionary).
 //   Clients with an empty bundle id (rare: raw CLI processes) are keyed by
@@ -101,9 +102,11 @@ extern "C" {
 #define kFadedProtocolVersion       "1"
 
 // 'fsta' — READ ONLY, CFPropertyList (CFDictionary)
-//   Diagnostics: { "fifoFrames": CFNumber, "underruns": CFNumber,
-//                  "overruns": CFNumber, "outputRunning": CFBoolean,
-//                  "tapRunning": CFBoolean, "sampleRate": CFNumber }
+//   Diagnostics AND the master output meter (polled ~15 Hz while the menu is
+//   open): { "fifoFrames", "underruns", "overruns", "trims", "sampleRate",
+//   "clients", "outputRunning", "tapRunning",
+//     "peakL": CFNumber(0..1), "peakR": CFNumber(0..1) }
+//   peakL/peakR are decaying peak-hold values of the final mixed output.
 #define kFadedProp_Stats            'fsta'
 
 #ifdef __cplusplus

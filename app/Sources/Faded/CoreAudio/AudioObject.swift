@@ -170,6 +170,15 @@ enum AudioSystem {
         try AudioObject.set(object, .init(kAudioHardwarePropertyDefaultOutputDevice), id)
     }
 
+    static var defaultInputDevice: AudioDeviceID? {
+        let id: AudioDeviceID? = try? AudioObject.get(object, .init(kAudioHardwarePropertyDefaultInputDevice))
+        return id.flatMap { $0 == kAudioObjectUnknown ? nil : $0 }
+    }
+
+    static func setDefaultInputDevice(_ id: AudioDeviceID) throws {
+        try AudioObject.set(object, .init(kAudioHardwarePropertyDefaultInputDevice), id)
+    }
+
     static var defaultSystemOutputDevice: AudioDeviceID? {
         let id: AudioDeviceID? = try? AudioObject.get(object, .init(kAudioHardwarePropertyDefaultSystemOutputDevice))
         return id.flatMap { $0 == kAudioObjectUnknown ? nil : $0 }

@@ -55,6 +55,17 @@ enum ProcessResolver {
         return ResolvedApp(id: bundleID.isEmpty ? "pid:\(pid)" : bundleID, name: name, pid: pid, isBare: true)
     }
 
+    /// Name + icon for an app that isn't currently running (starred favourites).
+    static func staticInfo(bundleID: String) -> (name: String, icon: NSImage)? {
+        guard !bundleID.hasPrefix("pid:"),
+              let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+        else { return nil }
+        let name = (Bundle(url: url)?.infoDictionary?["CFBundleDisplayName"] as? String)
+            ?? (Bundle(url: url)?.infoDictionary?["CFBundleName"] as? String)
+            ?? url.deletingPathExtension().lastPathComponent
+        return (name, NSWorkspace.shared.icon(forFile: url.path))
+    }
+
     static func icon(for app: ResolvedApp) -> NSImage {
         if let running = NSRunningApplication(processIdentifier: app.pid), let icon = running.icon { return icon }
         if !app.id.hasPrefix("pid:"), let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.id) {

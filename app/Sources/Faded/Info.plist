@@ -30,6 +30,8 @@
 	<string>Faded uses an administrator prompt to install its audio driver.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string></string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Faded needs microphone access only to draw the input level meter. Audio is measured and immediately discarded — nothing is recorded.</string>
 	<key>NSSupportsSuddenTermination</key>
 	<false/>
 </dict>

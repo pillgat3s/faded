@@ -7,7 +7,7 @@ import Foundation
 
 struct AudioDevice: Identifiable, Hashable, Sendable {
     enum Transport: Sendable {
-        case builtIn, usb, bluetooth, airPlay, hdmi, displayPort, thunderbolt, aggregate, virtual, other
+        case builtIn, usb, bluetooth, airPlay, hdmi, displayPort, thunderbolt, aggregate, virtual, continuity, other
 
         init(raw: UInt32) {
             switch raw {
@@ -20,6 +20,8 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
             case kAudioDeviceTransportTypeThunderbolt: self = .thunderbolt
             case kAudioDeviceTransportTypeAggregate: self = .aggregate
             case kAudioDeviceTransportTypeVirtual: self = .virtual
+            case kAudioDeviceTransportTypeContinuityCaptureWired,
+                 kAudioDeviceTransportTypeContinuityCaptureWireless: self = .continuity
             default: self = .other
             }
         }
@@ -35,8 +37,21 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
             case .thunderbolt: "bolt.horizontal"
             case .aggregate: "square.stack.3d.up"
             case .virtual: "waveform"
+            case .continuity: "iphone"
             case .other: "speaker.wave.2"
             }
+        }
+    }
+
+    /// SF Symbol for this device in a given role. Output uses the transport
+    /// glyph; input falls back to a microphone for devices whose transport
+    /// carries no useful picture (a plain USB interface, an aggregate, …).
+    func symbol(forInput: Bool) -> String {
+        guard forInput else { return transport.symbol }
+        switch transport {
+        case .builtIn, .continuity, .bluetooth: return transport.symbol
+        case .usb, .aggregate, .virtual, .other, .thunderbolt: return "mic"
+        case .airPlay, .hdmi, .displayPort: return transport.symbol
         }
     }
 
@@ -45,8 +60,11 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
     let name: String
     let transport: Transport
     let hasOutput: Bool
+    let hasInput: Bool
     let hasHardwareVolume: Bool
     let hasHardwareMute: Bool
+    /// Input side has a settable volume (built-in mic yes, many USB headsets no).
+    let hasInputVolume: Bool
     let isHidden: Bool
 
     // MARK: Snapshot
@@ -58,9 +76,11 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
         name = AudioObject.getString(id, .init(kAudioObjectPropertyName)) ?? uid
         let rawTransport: UInt32 = (try? AudioObject.get(id, .init(kAudioDevicePropertyTransportType))) ?? 0
         transport = Transport(raw: rawTransport)
-        hasOutput = Self.outputChannelCount(id) > 0
+        hasOutput = Self.channelCount(id, scope: kAudioObjectPropertyScopeOutput) > 0
+        hasInput = Self.channelCount(id, scope: kAudioObjectPropertyScopeInput) > 0
         hasHardwareVolume = Self.volumeAddress(for: id) != nil
         hasHardwareMute = Self.muteAddress(for: id) != nil
+        hasInputVolume = Self.volumeAddress(for: id, scope: kAudioObjectPropertyScopeInput) != nil
         let hidden: UInt32 = (try? AudioObject.get(id, .init(kAudioDevicePropertyIsHidden))) ?? 0
         isHidden = hidden != 0
     }
@@ -74,6 +94,11 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
         all().filter { $0.hasOutput && !$0.isHidden && !$0.isFadedDevice }
     }
 
+    /// Input-capable, non-hidden devices, excluding Faded's own virtual ones.
+    static func selectableInputs() -> [AudioDevice] {
+        all().filter { $0.hasInput && !$0.isHidden && !$0.isFadedDevice }
+    }
+
     var isFadedDevice: Bool { uid == FadedProtocol.outputDeviceUID || uid == FadedProtocol.tapDeviceUID }
 
     var isAlive: Bool {
@@ -83,8 +108,8 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
 
     // MARK: Streams
 
-    private static func outputChannelCount(_ id: AudioDeviceID) -> Int {
-        let addr = AudioObjectPropertyAddress(kAudioDevicePropertyStreamConfiguration, scope: kAudioObjectPropertyScopeOutput)
+    private static func channelCount(_ id: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
+        let addr = AudioObjectPropertyAddress(kAudioDevicePropertyStreamConfiguration, scope: scope)
         guard let size = try? AudioObject.dataSize(id, addr), size > 0 else { return 0 }
         let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
         defer { raw.deallocate() }
@@ -99,21 +124,60 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
 
     /// The address macOS's own Sound slider uses (VirtualMainVolume), or the
     /// classic per-device VolumeScalar on the main element, or channel 1.
-    private static func volumeAddress(for id: AudioDeviceID) -> AudioObjectPropertyAddress? {
+    private static func volumeAddress(for id: AudioDeviceID,
+                                     scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeOutput) -> AudioObjectPropertyAddress?
+    {
         let candidates = [
-            AudioObjectPropertyAddress(kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope: kAudioObjectPropertyScopeOutput),
-            AudioObjectPropertyAddress(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput),
-            AudioObjectPropertyAddress(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, element: 1),
+            AudioObjectPropertyAddress(kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope: scope),
+            AudioObjectPropertyAddress(kAudioDevicePropertyVolumeScalar, scope: scope),
+            AudioObjectPropertyAddress(kAudioDevicePropertyVolumeScalar, scope: scope, element: 1),
         ]
         return candidates.first { AudioObject.has(id, $0) && AudioObject.isSettable(id, $0) }
     }
 
-    private static func muteAddress(for id: AudioDeviceID) -> AudioObjectPropertyAddress? {
+    private static func muteAddress(for id: AudioDeviceID,
+                                   scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeOutput) -> AudioObjectPropertyAddress?
+    {
         let candidates = [
-            AudioObjectPropertyAddress(kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput),
-            AudioObjectPropertyAddress(kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput, element: 1),
+            AudioObjectPropertyAddress(kAudioDevicePropertyMute, scope: scope),
+            AudioObjectPropertyAddress(kAudioDevicePropertyMute, scope: scope, element: 1),
         ]
         return candidates.first { AudioObject.has(id, $0) && AudioObject.isSettable(id, $0) }
+    }
+
+    // MARK: Input volume / mute
+
+    var inputVolume: Float? {
+        guard let addr = Self.volumeAddress(for: id, scope: kAudioObjectPropertyScopeInput) else { return nil }
+        return try? AudioObject.get(id, addr, as: Float32.self)
+    }
+
+    func setInputVolume(_ value: Float) {
+        guard let addr = Self.volumeAddress(for: id, scope: kAudioObjectPropertyScopeInput) else { return }
+        try? AudioObject.set(id, addr, Float32(min(max(value, 0), 1)))
+        let ch2 = AudioObjectPropertyAddress(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeInput, element: 2)
+        if addr.mElement == 1, AudioObject.has(id, ch2) { try? AudioObject.set(id, ch2, Float32(value)) }
+    }
+
+    var isInputMuted: Bool? {
+        guard let addr = Self.muteAddress(for: id, scope: kAudioObjectPropertyScopeInput) else { return nil }
+        let v: UInt32? = try? AudioObject.get(id, addr)
+        return v.map { $0 != 0 }
+    }
+
+    func setInputMuted(_ muted: Bool) {
+        guard let addr = Self.muteAddress(for: id, scope: kAudioObjectPropertyScopeInput) else { return }
+        try? AudioObject.set(id, addr, UInt32(muted ? 1 : 0))
+    }
+
+    var inputVolumeListenerAddresses: [AudioObjectPropertyAddress] {
+        let candidates = [
+            AudioObjectPropertyAddress(kAudioHardwareServiceDeviceProperty_VirtualMainVolume, scope: kAudioObjectPropertyScopeInput),
+            AudioObjectPropertyAddress(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeInput),
+            AudioObjectPropertyAddress(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeInput, element: 1),
+            AudioObjectPropertyAddress(kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeInput),
+        ]
+        return candidates.filter { AudioObject.has(id, $0) }
     }
 
     /// 0…1 scalar, or nil if the device has no settable volume.

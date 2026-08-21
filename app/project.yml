@@ -49,6 +49,10 @@ targets:
         NSHumanReadableCopyright: ""
         NSSupportsSuddenTermination: false
         NSAppleEventsUsageDescription: "Faded uses an administrator prompt to install its audio driver."
+        # The input level meter has to open a capture stream — there is no
+        # CoreAudio property that reports a microphone's level. Samples are
+        # measured and dropped; nothing is recorded or stored.
+        NSMicrophoneUsageDescription: "Faded needs microphone access only to draw the input level meter. Audio is measured and immediately discarded — nothing is recorded."
 schemes:
   Faded:
     build:
