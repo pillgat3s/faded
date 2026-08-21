@@ -78,7 +78,10 @@ that happens to hold the device open.
 
 **Meters.** Output level comes free: the driver already has the mixed buffer.
 Input level does not exist as a property anywhere in CoreAudio, so it can only
-be obtained by opening a capture stream — see *Privacy* below.
+be obtained by opening a capture stream, which is why that meter is opt-in.
+
+**The read-back costs you the microphone indicator.** See *Privacy* below —
+it is the one genuinely unpleasant consequence of this design.
 
 ### AirPlay
 
@@ -113,11 +116,30 @@ unpacked from `chrome://extensions` — see [its README](extension/README.md).
 
 ## Privacy
 
-- **The microphone is off by default.** The input level meter is the only
-  feature that touches it, it is opt-in in Settings, and while it runs it
-  measures the peak and discards the samples — nothing is recorded, buffered or
-  written. macOS shows the orange indicator for as long as any capture stream
-  is open, so Faded releases it the moment the menu closes.
+**macOS shows the orange microphone indicator while Faded is routing audio.**
+It is not recording you, but the indicator is honest about what it measures, so
+here is exactly why it appears.
+
+To get audio back out of the driver, the app opens an input stream on the
+hidden "Faded Tap" device and plays what it reads to the real output. macOS
+lights the privacy indicator for *any* process holding an audio input stream —
+it does not distinguish a virtual, hidden device from a real microphone. So the
+indicator tracks the play-through path, not a microphone.
+
+What that stream carries is the audio your apps are playing, on its way to your
+speakers. It is never written anywhere, and Faded has no network code at all.
+
+This is a property of the virtual-device design rather than a bug, and removing
+it means replacing the read-back device with a shared-memory channel from the
+driver — see [issue tracking](../../issues). Until then, if the indicator
+bothers you, turning off "Route audio through Faded" in Settings makes it go
+away, at the cost of everything Faded does.
+
+Separately:
+
+- **The input level meter is off by default and opt-in.** It is the only
+  feature that touches a *real* microphone. While on, it measures the peak and
+  discards the samples, and it is released the moment the menu closes.
 - Bluetooth inputs are never metered: opening a capture stream on an
   AirPods-class device forces the A2DP→HFP profile switch that wrecks playback.
 - No network code, no analytics, no accounts. Settings live in
