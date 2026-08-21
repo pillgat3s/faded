@@ -57,6 +57,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             renderMenu(to: args[i + 1], expanded: args.contains("--expanded"), demo: args.contains("--demo"))
             NSApp.terminate(nil)
         }
+        // `Faded --diagnose` prints what the engine is doing and exits. Log
+        // messages from a menu-bar app are awkward to capture; this is not.
+        if args.contains("--diagnose") {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(3))
+                print(router.diagnostics)
+                router.shutdown()
+                NSApp.terminate(nil)
+            }
+            return
+        }
         if let i = args.firstIndex(of: "--render-settings"), i + 1 < args.count {
             renderSettings(to: args[i + 1])
             NSApp.terminate(nil)

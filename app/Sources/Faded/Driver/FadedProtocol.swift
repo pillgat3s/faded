@@ -17,7 +17,7 @@ enum FadedProtocol {
     static let defaultSampleRate = 48000.0
     static let supportedSampleRates: [Double] = [44100, 48000, 88200, 96000]
 
-    static let protocolVersion = "2"
+    static let protocolVersion = "3"
 
     /// Custom property selectors on the Faded output device object.
     enum Prop {
@@ -25,6 +25,7 @@ enum FadedProtocol {
         static let appGains = fourCC("fapv")
         static let bypassMaster = fourCC("fbyp")
         static let hideOutput = fourCC("fhid")
+        static let displayName = fourCC("fnam")
         static let version = fourCC("fver")
         static let stats = fourCC("fsta")
     }

@@ -98,11 +98,20 @@ extern "C" {
 //   tomorrow's test decides; the app falls back to visible if it doesn't.
 #define kFadedProp_HideOutput       'fhid'
 
+// 'fnam' — READ/WRITE, CFString
+//   Display name the Faded device reports as kAudioObjectPropertyName.
+//   Faded.app keeps this set to the name of the device it is currently playing
+//   to, so macOS's own volume HUD, Sound settings and Control Center all name
+//   the speakers you are actually listening on rather than saying "Faded".
+//   Setting it fires a property-changed notification for the name so those UIs
+//   refresh immediately. Reset to "Faded" when nothing is being routed.
+#define kFadedProp_DisplayName      'fnam'
+
 // 'fver' — READ ONLY, CFString
 //   Driver protocol version, e.g. "1". App refuses to drive an incompatible
 //   driver and offers reinstall.
 #define kFadedProp_Version          'fver'
-#define kFadedProtocolVersion       "2"
+#define kFadedProtocolVersion       "3"
 
 // 'fsta' — READ ONLY, CFPropertyList (CFDictionary)
 //   Diagnostics AND the master output meter (polled ~15 Hz while the menu is

@@ -417,6 +417,22 @@ public:
                 }
             }));
 
+        RegisterCustomProperty(kFadedProp_DisplayName,
+            std::function<CFStringRef()>([this] { return makeCFString(GetName()); }),
+            std::function<void(CFStringRef)>([this](CFStringRef v) {
+                if (!v) return;
+                {
+                    std::lock_guard<std::mutex> lock(nameMutex_);
+                    const std::string next = toStdString(v);
+                    if (next.empty() || next == displayName_) return;
+                    displayName_ = next;
+                }
+                // Both: the name itself, and our own property so a second
+                // client can observe the change.
+                NotifyPropertyChanged(kAudioObjectPropertyName);
+                NotifyPropertyChanged(kFadedProp_DisplayName);
+            }));
+
         RegisterCustomProperty(kFadedProp_Stats,
             std::function<CFPropertyListRef()>([this] { return copyStats(); }),
             std::function<void(CFPropertyListRef)>{});
@@ -424,6 +440,14 @@ public:
 
     // Called by the handler when clients come and go.
     void clientsChanged() { NotifyPropertyChanged(kFadedProp_Clients); }
+
+    //! Reports whatever Faded.app last set, so the system volume HUD names the
+    //! real speakers instead of this device. Invoked by HAL on control threads.
+    std::string GetName() const override
+    {
+        std::lock_guard<std::mutex> lock(nameMutex_);
+        return displayName_;
+    }
 
     // Look up the stored gain for a client key (control thread).
     float gainFor(const std::string& key)
@@ -519,6 +543,8 @@ private:
     }
 
     std::shared_ptr<OutputHandler> handler_;
+    mutable std::mutex nameMutex_;
+    std::string displayName_ = kFadedOutputDeviceName;
 };
 
 std::shared_ptr<aspl::Client> OutputHandler::OnAddClient(const aspl::ClientInfo& info)

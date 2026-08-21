@@ -94,6 +94,13 @@ final class DriverLink {
         try? AudioObject.setCF(id, .init(FadedProtocol.Prop.appGains), dict)
     }
 
+    /// Make the Faded device report `name`, so macOS's volume HUD and Sound
+    /// settings show the speakers the audio is really going to.
+    func setDisplayName(_ name: String) {
+        guard let id = outputDevice?.id, !name.isEmpty else { return }
+        try? AudioObject.setCF(id, .init(FadedProtocol.Prop.displayName), name as CFString)
+    }
+
     func setBypassMaster(_ bypass: Bool) {
         guard let id = outputDevice?.id else { return }
         try? AudioObject.setCF(id, .init(FadedProtocol.Prop.bypassMaster), (bypass ? kCFBooleanTrue : kCFBooleanFalse)!)

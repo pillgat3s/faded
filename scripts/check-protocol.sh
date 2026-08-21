@@ -23,7 +23,7 @@ check outputUID  'define kFadedOutputDeviceUID'  'outputDeviceUID ='
 check outputName 'define kFadedOutputDeviceName' 'outputDeviceName ='
 check appBundle  'define kFadedAppBundleID'      'appBundleID ='
 check version    'define kFadedProtocolVersion'  'protocolVersion ='
-for sel in fcli fapv fbyp fhid fver fsta; do
+for sel in fcli fapv fbyp fhid fnam fver fsta; do
   grep -q "'$sel'" "$H" && grep -q "\"$sel\"" "$S" && echo "ok selector $sel" || { echo "MISMATCH selector $sel"; fail=1; }
 done
 # The shared ring's layout is imported by the app rather than mirrored, but the

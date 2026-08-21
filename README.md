@@ -204,12 +204,14 @@ turn one on.
   the real device when you quit, but it can't if it crashes; relaunching fixes
   it.
 - **Stereo only.** Multichannel content is not passed through.
-- Control Center shows "Faded" as the selected output while it's engaged.
-  Picking a real device there works — Faded follows — it just won't *show* as
-  selected. There's an experimental setting to hide Faded from macOS's device
-  lists entirely; whether macOS will accept a hidden device as the default
-  output is not yet established, and Faded turns the setting back off if it
-  won't.
+- **Faded reports the name of the device it is playing to**, so macOS's volume
+  HUD, Sound settings and Control Center all show "AirPods Pro" or "Astro A50
+  Game" rather than "Faded". The side effect is that macOS's own lists show that
+  name twice — once for the real device, once for Faded impersonating it. Faded
+  can be told apart by its transport type (`virt`).
+  Hiding Faded from those lists would have been tidier, and was tried: **macOS
+  refuses to use a device with `kAudioDevicePropertyIsHidden` as the default
+  output**, so that idea is settled and the setting is gone.
 - Adds roughly 5–15 ms of latency.
 - Input volume only works on devices that expose a hardware input control.
 - Not suitable for bit-perfect playback chains — there is an extra hop.

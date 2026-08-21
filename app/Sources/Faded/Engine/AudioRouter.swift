@@ -65,16 +65,6 @@ final class AudioRouter {
         }
     }
 
-    /// Hide the "Faded" device from Sound settings / Control Center. `engage()`
-    /// verifies macOS still accepts it as default output and reverts if not.
-    var hideFadedDevice: Bool {
-        didSet {
-            guard oldValue != hideFadedDevice else { return }
-            defaults.set(hideFadedDevice, forKey: Keys.hideFaded)
-            applyHiddenPreference()
-        }
-    }
-
     /// Draw level meters next to devices and apps.
     var showMeters: Bool {
         didSet {
@@ -208,7 +198,6 @@ final class AudioRouter {
         static let appKeys = "appKeys"
         static let lastTarget = "lastTargetUID"
         static let previousTargets = "previousTargets"
-        static let hideFaded = "hideFadedDevice"
         static let showMeters = "showMeters"
         static let showInputMeter = "showInputMeter"
         static let showInputSection = "showInputSection"
@@ -219,7 +208,6 @@ final class AudioRouter {
 
     init() {
         enabled = defaults.object(forKey: Keys.enabled) as? Bool ?? true
-        hideFadedDevice = defaults.bool(forKey: Keys.hideFaded)
         showMeters = defaults.object(forKey: Keys.showMeters) as? Bool ?? true
         showInputMeter = defaults.bool(forKey: Keys.showInputMeter)   // opt-in: uses the mic
         showInputSection = defaults.object(forKey: Keys.showInputSection) as? Bool ?? true
@@ -288,15 +276,15 @@ final class AudioRouter {
             Self.log.error("engine start failed: \(String(describing: error))")
             return
         }
-        applyHiddenPreference()
+        // Tested and settled: macOS refuses to use a device with
+        // kAudioDevicePropertyIsHidden set as the default output, so Faded is
+        // always visible. It reports the target's name instead (see
+        // driver.setDisplayName), which is what the volume HUD shows.
+        driver.setOutputHidden(false)
         setSystemDefault(to: faded.id)
-        if AudioSystem.defaultOutputDevice != faded.id, hideFadedDevice {
-            Self.log.warning("hidden Faded device rejected as default output; unhiding")
-            hideFadedDevice = false
-            setSystemDefault(to: faded.id)
-        }
         installFadedControlListeners()
         installTargetListeners()
+        driver.setDisplayName(initialTarget.name)
         pushAllAppGains()
         applyVolumeForTarget()
         isEngaged = true
@@ -315,6 +303,8 @@ final class AudioRouter {
         }
         outputLevel = (0, 0)
         isEngaged = false
+        // Nothing is being routed any more; stop impersonating a real device.
+        driver.setDisplayName(FadedProtocol.outputDeviceName)
         Self.log.info("disengaged")
     }
 
@@ -322,11 +312,6 @@ final class AudioRouter {
     func shutdown() {
         inputMeter.stop()
         disengage(restoreDefault: true)
-    }
-
-    private func applyHiddenPreference() {
-        guard driver.isReady else { return }
-        if driver.isOutputHidden != hideFadedDevice { driver.setOutputHidden(hideFadedDevice) }
     }
 
     // MARK: Output selection
@@ -371,6 +356,7 @@ final class AudioRouter {
         }
         installTargetListeners()
         applyVolumeForTarget()
+        driver.setDisplayName(device.name)
         Self.log.info("target → \(device.name)")
     }
 
@@ -938,7 +924,9 @@ final class AudioRouter {
     // MARK: Diagnostics
 
     var diagnostics: String {
-        var s = "driver: \(driverStatus)\n"
+        var s = "driver: \(driverStatus)  enabled: \(enabled)\n"
+        let ringRate: String = engine.reader.sampleRate.map { "\($0)" } ?? "-"
+        s += "shared ring open: \(engine.reader.isOpen)  ring rate: \(ringRate)\n"
         s += "engaged: \(isEngaged)  output: \(target?.name ?? "-")  input: \(selectedInput?.name ?? "-")\n"
         s += "output has hw volume: \(target?.hasHardwareVolume ?? false) (false ⇒ Faded applies it in software)\n"
         let e = engine.stats
