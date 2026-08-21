@@ -29,7 +29,7 @@ CONFIG     ?= Release
 -include $(ROOT)/local.mk
 CODESIGN_ID ?= -
 
-.PHONY: all driver app install install-driver uninstall-driver uninstall check-protocol clean
+.PHONY: all driver app install reinstall check-clients install-driver uninstall-driver uninstall check-protocol clean
 
 all: driver app
 
@@ -52,6 +52,27 @@ install: app
 	cp -R $(OUT)/Faded.app /Applications/
 	open /Applications/Faded.app
 	@echo "Faded is running in the menu bar. Click it → Install Driver…"
+
+# Driver and app are versioned together (the app refuses a driver whose
+# protocol version differs), so after changing either, install both. Installing
+# the driver restarts coreaudiod, which invalidates every handle the running
+# app holds — including its shared-memory mapping — so the app is restarted too.
+reinstall: all
+	sudo $(ROOT)/scripts/install-driver.sh $(DRIVER_DIR)/build/FadedDriver.driver
+	-osascript -e 'tell application "Faded" to quit' 2>/dev/null
+	@sleep 1
+	-pkill -x Faded 2>/dev/null
+	@rm -rf /Applications/Faded.app
+	cp -R $(OUT)/Faded.app /Applications/
+	open /Applications/Faded.app
+	@echo
+	@echo "Installed. Play something, then check per-app metering with:"
+	@echo "    make check-clients"
+
+# Reads the driver's live client list. Any app making sound should appear with
+# a non-zero peak; if everything reads 0 the per-client path is not running.
+check-clients:
+	@python3 $(ROOT)/scripts/check-clients.py
 
 install-driver: driver
 	sudo $(ROOT)/scripts/install-driver.sh $(DRIVER_DIR)/build/FadedDriver.driver
