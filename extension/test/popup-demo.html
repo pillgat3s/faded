@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Faded Tabs — popup demo</title>
+  <link rel="stylesheet" href="../popup.css">
+  <style>body { width: 320px; }</style>
+</head>
+<body>
+  <header>
+    <h1>Tab Volume</h1>
+    <button id="reset" type="button" title="Reset every tab and site to 100%">Reset all</button>
+  </header>
+  <ul id="tabs" aria-live="polite"></ul>
+  <p id="empty" hidden>Nothing is playing audio.</p>
+
+  <script>
+    // Stands in for the extension APIs so the popup can be styled, screenshotted
+    // and eyeballed without loading it into a browser.
+    const FAKE = [
+      { id: 1, title: 'Rick Astley — Never Gonna Give You Up', favIconUrl: '', url: 'https://www.youtube.com/watch?v=x',
+        audible: true, muted: false, active: true, gain: 0.35, adjustable: true },
+      { id: 2, title: 'Lofi hip hop radio — beats to relax/study to', favIconUrl: '', url: 'https://www.youtube.com/watch?v=y',
+        audible: true, muted: false, active: false, gain: 1, adjustable: true },
+      { id: 3, title: 'Discord | #general', favIconUrl: '', url: 'https://discord.com/channels/1',
+        audible: true, muted: true, active: false, gain: 0.8, adjustable: true },
+      { id: 4, title: 'Extensions', favIconUrl: '', url: 'chrome://extensions',
+        audible: false, muted: false, active: false, gain: 1, adjustable: false },
+    ];
+    window.chrome = {
+      runtime: {
+        sendMessage: async (message) => {
+          if (message.type === 'listTabs') return { tabs: FAKE, hasOverrides: true };
+          return { ok: true };
+        },
+      },
+    };
+  </script>
+  <script src="../popup.js"></script>
+</body>
+</html>

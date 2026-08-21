@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Faded Tabs — hook tests</title>
+  <style>
+    body { font: 13px/1.5 -apple-system, system-ui, sans-serif; background: #1c1c1e; color: #eee; padding: 20px; }
+    li { list-style: none; margin: 2px 0; font-family: ui-monospace, Menlo, monospace; }
+    .pass::before { content: "PASS  "; color: #30d158; }
+    .fail::before { content: "FAIL  "; color: #ff453a; }
+    h1 { font-size: 15px; }
+    #summary { margin-top: 12px; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h1>Faded Tabs — page.js hook tests</h1>
+  <p>Open this page directly (any static server) to check the interception logic
+     without loading the extension. It stubs the messaging that content.js
+     normally does.</p>
+  <ul id="out"></ul>
+  <div id="summary"></div>
+
+  <script>
+    // Capture the untouched accessor first — this is how the tests observe the
+    // *real* volume that reaches the element after page.js scales it.
+    window.__realVolume = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'volume');
+  </script>
+  <script src="../page.js"></script>
+  <script>
+    const out = document.getElementById('out');
+    let passed = 0, failed = 0;
+
+    function check(name, actual, expected) {
+      const ok = Math.abs(Number(actual) - Number(expected)) < 1e-6;
+      const li = document.createElement('li');
+      li.className = ok ? 'pass' : 'fail';
+      li.textContent = `${name} — got ${actual}, expected ${expected}`;
+      out.append(li);
+      ok ? passed++ : failed++;
+    }
+
+    function setGain(g) {
+      window.postMessage({ channel: 'faded-tabs:set', gain: g }, '*');
+    }
+
+    const realOf = (el) => window.__realVolume.get.call(el);
+
+    (async () => {
+      const wait = () => new Promise((r) => setTimeout(r, 30));
+
+      const el = document.createElement('audio');
+      document.body.append(el);
+
+      // Unity gain: nothing should change.
+      el.volume = 0.8;
+      await wait();
+      check('gain 1.0 leaves the element alone', realOf(el), 0.8);
+      check('getter returns what the page set', el.volume, 0.8);
+
+      // Attenuate: the element gets scaled, the page still sees its own value.
+      setGain(0.25);
+      await wait();
+      check('gain 0.25 scales the element', realOf(el), 0.2);
+      check('getter still reports the page value', el.volume, 0.8);
+
+      // The page moving its own slider composes with our gain.
+      el.volume = 0.5;
+      await wait();
+      check('page setting 0.5 under gain 0.25', realOf(el), 0.125);
+      check('getter reports 0.5', el.volume, 0.5);
+
+      // Back to unity restores the page's intent exactly.
+      setGain(1);
+      await wait();
+      check('restoring gain 1.0 returns to 0.5', realOf(el), 0.5);
+
+      // An element created while attenuated is caught when it plays.
+      setGain(0.5);
+      await wait();
+      const late = document.createElement('audio');
+      document.body.append(late);
+      late.volume = 0.6;
+      await wait();
+      check('element created after the gain change', realOf(late), 0.3);
+
+      // Web Audio: destination must be a gain node carrying our value.
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const dest = ctx.destination;
+      check('destination is a GainNode', dest instanceof GainNode ? 1 : 0, 1);
+      check('destination gain matches', dest.gain ? dest.gain.value : -1, 0.5);
+      setGain(0.75);
+      await wait();
+      check('destination gain follows changes', dest.gain ? dest.gain.value : -1, 0.75);
+      check('destination is stable across reads', ctx.destination === dest ? 1 : 0, 1);
+      ctx.close();
+
+      const summary = document.getElementById('summary');
+      summary.textContent = `${passed} passed, ${failed} failed`;
+      summary.style.color = failed ? '#ff453a' : '#30d158';
+      document.title = failed ? `FAIL (${failed})` : `PASS (${passed})`;
+    })();
+  </script>
+</body>
+</html>

@@ -95,6 +95,22 @@ is selected again. Pick AirPlay in Control Center exactly as you do now; you
 just lose per-app volume for as long as you're on it, because nothing of
 Faded's is in the path.
 
+## Per-tab volume in the browser
+
+A browser is one audio client as far as macOS is concerned — Chrome and Brave
+mix every tab through a single audio service process, and Safari routes all
+media through `com.apple.WebKit.GPU`. At the CoreAudio layer there is literally
+one stream, so no audio driver, Faded's or anyone else's, can separate tabs.
+
+[`extension/`](extension/) is a companion Chrome/Brave extension that does it
+from inside the browser instead: it intercepts `HTMLMediaElement.volume` and
+the Web Audio destination in each page, giving every tab its own level. Load it
+unpacked from `chrome://extensions` — see [its README](extension/README.md).
+
+<p align="center">
+  <img src="docs/extension.png" width="320" alt="The Faded Tabs popup: one row per tab with favicon, title, percentage and volume slider">
+</p>
+
 ## Privacy
 
 - **The microphone is off by default.** The input level meter is the only
