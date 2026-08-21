@@ -99,7 +99,19 @@ function render(tabs) {
     wrap.append(slider);
     row.append(wrap);
 
-    value.nodeValue = tab.adjustable ? `${Math.round(slider.value)}%` : 'n/a';
+    if (!tab.adjustable) {
+      value.nodeValue = 'n/a';
+    } else if (tab.hooked === false) {
+      // The page has no hooks — almost always a tab that predates the
+      // extension being loaded. Say so instead of moving a slider that does
+      // nothing.
+      value.nodeValue = 'reload';
+      slider.disabled = true;
+      row.title = 'Reload this tab to control its volume';
+      title.style.opacity = '0.6';
+    } else {
+      value.nodeValue = `${Math.round(slider.value)}%`;
+    }
 
     const mute = document.createElement('button');
     mute.type = 'button';

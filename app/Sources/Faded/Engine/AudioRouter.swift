@@ -162,8 +162,10 @@ final class AudioRouter {
     private var fadedControlListeners: [ListenerToken] = []
     private var targetControlListeners: [ListenerToken] = []
     private var targetRateListener: ListenerToken?
+    private var fadedRateListener: ListenerToken?
     private var inputControlListeners: [ListenerToken] = []
     private var meterTimer: Timer?
+    private var adoptRetry: DispatchWorkItem?
     private var idleTicks = 0
 
     private var previewMode = false      // DEBUG --render-menu only
@@ -298,6 +300,7 @@ final class AudioRouter {
         fadedControlListeners.removeAll()
         targetControlListeners.removeAll()
         targetRateListener = nil
+        fadedRateListener = nil
         if restoreDefault, let t = target, t.isAlive {
             setSystemDefault(to: t.id)
         }
@@ -361,9 +364,11 @@ final class AudioRouter {
     }
 
     private func startEngine(for device: AudioDevice) throws {
-        let wanted = engineRate(for: device)
-        let actual = driver.setSampleRate(wanted)
-        try engine.start(output: device.id, sampleRate: actual)
+        // Whatever rate the Faded device is currently running at is the rate
+        // the driver produces frames at. Follow it rather than imposing one —
+        // the output unit converts to the target device's own rate anyway.
+        let rate = driver.outputDevice?.nominalSampleRate ?? FadedProtocol.defaultSampleRate
+        try engine.start(output: device.id, sampleRate: rate > 0 ? rate : FadedProtocol.defaultSampleRate)
     }
 
     /// Run the virtual devices at the target's rate when we can, so nothing
@@ -436,44 +441,66 @@ final class AudioRouter {
         }
     }
 
-    /// The system default output moved. Two cases matter:
+    /// The system default output moved.
     ///
-    ///  * It moved to a real device we can play to (Control Center pick,
-    ///    AirPods auto-switch, another app): adopt it as the target and take
-    ///    the default back, so everything keeps flowing through Faded.
+    /// Normally we adopt the new device as the play-to target and take the
+    /// default back, so everything keeps flowing through Faded.
     ///
-    ///  * It moved somewhere we *cannot* follow. AirPlay is the real-world
-    ///    case: speakers like a Sonos or an Apple TV are not CoreAudio devices
-    ///    at all — macOS routes them above the HAL — so there is nothing for
-    ///    our play-through to open. Fighting for the default here would yank
-    ///    the user straight back off their AirPlay speaker, so instead Faded
-    ///    steps aside completely and lets macOS do it natively. When an
-    ///    adoptable device becomes the default again, Faded re-engages.
+    /// The subtle case is AirPlay. An AirPlay speaker is not a CoreAudio device
+    /// while it is idle — macOS *materialises* a device named "AirPlay" at the
+    /// instant you pick one, and makes it the default in the same breath. Its
+    /// streams are not configured yet when the notification arrives, so a
+    /// snapshot taken right now reports no output channels and it looks like
+    /// something we cannot play to. Standing down on that first look is what
+    /// made Faded miss AirPlay entirely; instead the device gets a few hundred
+    /// milliseconds to finish appearing before we give up on it.
     private func defaultOutputChanged() {
         guard !settingDefault, let faded = driver.outputDevice else { return }
         guard let current = AudioSystem.defaultOutputDevice, current != faded.id else { return }
+        adopt(current, attempt: 0)
+    }
 
-        let dev = AudioDevice(id: current)
-        let adoptable = dev.map { $0.hasOutput && !$0.isFadedDevice && $0.isAlive } ?? false
+    /// Adopt `deviceID` if we can play to it, retrying briefly while it settles.
+    private func adopt(_ deviceID: AudioDeviceID, attempt: Int) {
+        guard let faded = driver.outputDevice else { return }
+        // Something else moved the default again while we were waiting.
+        guard AudioSystem.defaultOutputDevice == deviceID else { return }
 
-        if isEngaged {
-            if adoptable, let dev {
-                Self.log.info("system default moved to \(dev.name) — following")
-                retarget(dev)
+        let device = AudioDevice(id: deviceID)
+        let adoptable = device.map { $0.hasOutput && !$0.isFadedDevice && $0.isAlive } ?? false
+
+        if adoptable, let device {
+            if isEngaged {
+                Self.log.info("system default moved to \(device.name) — following")
+                retarget(device)
                 setSystemDefault(to: faded.id)
-            } else {
-                Self.log.info("default moved somewhere Faded can't follow — stepping aside")
-                steppedAside = true
-                disengage(restoreDefault: false)
-                target = dev
-                readVolumeFromTargetDirectly()
+            } else if enabled, driver.isReady {
+                Self.log.info("adoptable device \(device.name) is default — engaging")
+                steppedAside = false
+                target = device
+                engage()
             }
-        } else if enabled, steppedAside, adoptable, let dev {
-            Self.log.info("adoptable device \(dev.name) is default again — re-engaging")
-            steppedAside = false
-            target = dev
-            engage()
+            return
         }
+
+        if attempt < 6 {
+            adoptRetry?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                Task { @MainActor in self?.adopt(deviceID, attempt: attempt + 1) }
+            }
+            adoptRetry = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+            return
+        }
+
+        // Genuinely cannot follow it. Let macOS route natively rather than
+        // fighting for the default and yanking playback away from the user.
+        guard isEngaged else { return }
+        Self.log.info("default moved somewhere Faded can't follow — stepping aside")
+        steppedAside = true
+        disengage(restoreDefault: false)
+        target = device
+        readVolumeFromTargetDirectly()
     }
 
     private func devicesChanged() {
@@ -611,6 +638,26 @@ final class AudioRouter {
             AudioObject.listen(faded.id, addr) { [weak self] in
                 Task { @MainActor in self?.fadedControlChanged() }
             }
+        }
+        // coreaudiod re-rates the Faded device to suit its clients — open a
+        // 44.1 kHz track and the device follows it. The driver then produces
+        // frames at that rate, so the play-through has to be reopened to match
+        // or it drains the ring at the wrong speed and glitches continuously.
+        fadedRateListener = AudioObject.listen(faded.id, .init(kAudioDevicePropertyNominalSampleRate)) { [weak self] in
+            Task { @MainActor in self?.fadedRateChanged() }
+        }
+    }
+
+    private func fadedRateChanged() {
+        guard isEngaged, let t = target, let faded = driver.outputDevice else { return }
+        let rate = faded.nominalSampleRate
+        guard rate > 0, abs(rate - engine.sampleRate) >= 1 else { return }
+        Self.log.info("Faded device re-rated to \(rate) — reopening play-through")
+        do {
+            try engine.start(output: t.id, sampleRate: rate)
+        } catch {
+            lastError = "\(error)"
+            Self.log.error("reopen after rate change failed: \(String(describing: error))")
         }
     }
 

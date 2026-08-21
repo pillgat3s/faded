@@ -97,18 +97,28 @@ off by default — see *Privacy* below.
 
 ### AirPlay
 
-**AirPlay speakers are not CoreAudio devices.** A Sonos or an Apple TV shows up
-in the stock Sound menu but never appears in the HAL device list; macOS routes
-AirPlay above the HAL through a private path. Faded therefore cannot list them
-or play to them.
+An AirPlay speaker is **not** a CoreAudio device while it is idle — a Sonos or
+an Apple TV appears in the stock Sound menu but nowhere in the HAL device list,
+because macOS discovers those over the network rather than through the audio
+stack. That is why Faded cannot list them, and why the menu points you at
+Control Center to pick one.
 
-What it does instead is **step aside**. When the system default output moves to
-something Faded can't adopt, it disengages rather than fighting to take the
-default back — which would otherwise yank you straight off your AirPlay
-speaker. The menu says so, and Faded re-engages by itself once a normal device
-is selected again. Pick AirPlay in Control Center exactly as you do now; you
-just lose per-app volume for as long as you're on it, because nothing of
-Faded's is in the path.
+The moment you *do* pick one, though, macOS materialises a real CoreAudio
+device called "AirPlay" (transport type `airp`) and makes it the default
+output. Faded adopts it like any other device, so **per-app volume and the
+volume keys keep working while you are on AirPlay**, and the device disappears
+again when you switch away.
+
+The one subtlety is timing: that device is created in the same breath as it
+becomes the default, and its streams are not configured yet when the
+notification arrives — a snapshot taken right then reports no output channels
+and it looks like something Faded cannot play to. Faded therefore re-checks for
+a few hundred milliseconds before concluding anything.
+
+If a device really cannot be followed, Faded **steps aside**: it disengages and
+lets macOS route natively rather than fighting for the default, which would
+otherwise drag you off whatever you just selected. It re-engages by itself once
+an adoptable device is the default again.
 
 ## Per-tab volume in the browser
 

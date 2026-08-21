@@ -263,12 +263,7 @@ public:
 
     // -- I/O lifecycle (control thread) ---------------------------------
 
-    OSStatus OnStartIO() override
-    {
-        SharedRing::shared().setRunning(true);
-        running_.store(true, std::memory_order_relaxed);
-        return kAudioHardwareNoError;
-    }
+    OSStatus OnStartIO() override;
 
     void publishSampleRate(UInt32 rate) { SharedRing::shared().setSampleRate(rate); }
 
@@ -441,6 +436,28 @@ public:
     // Called by the handler when clients come and go.
     void clientsChanged() { NotifyPropertyChanged(kFadedProp_Clients); }
 
+    //! The ring carries no timing information, so the consumer has to be told
+    //! what rate the frames are being produced at. coreaudiod re-rates this
+    //! device to match whatever its clients want, so publishing the rate once
+    //! at construction is not enough: a device running at 44.1 kHz while the
+    //! app plays out at 48 kHz drains the ring ~9% too fast, which sounds like
+    //! continuous glitching. Publish it on every change.
+    OSStatus SetNominalSampleRateImpl(Float64 rate) override
+    {
+        const OSStatus status = aspl::Device::SetNominalSampleRateImpl(rate);
+        if (status == kAudioHardwareNoError) {
+            SharedRing::shared().setSampleRate(static_cast<UInt32>(rate));
+        }
+        return status;
+    }
+
+    //! Belt and braces: whatever the rate is when I/O starts is what the app
+    //! must open its output at.
+    void publishCurrentSampleRate()
+    {
+        SharedRing::shared().setSampleRate(static_cast<UInt32>(GetNominalSampleRate()));
+    }
+
     //! Reports whatever Faded.app last set, so the system volume HUD names the
     //! real speakers instead of this device. Invoked by HAL on control threads.
     std::string GetName() const override
@@ -546,6 +563,18 @@ private:
     mutable std::mutex nameMutex_;
     std::string displayName_ = kFadedOutputDeviceName;
 };
+
+OSStatus OutputHandler::OnStartIO()
+{
+    // Publish the rate the device is actually running at before any frames are
+    // written, so the app opens its output to match.
+    if (auto dev = device_.lock()) {
+        dev->publishCurrentSampleRate();
+    }
+    SharedRing::shared().setRunning(true);
+    running_.store(true, std::memory_order_relaxed);
+    return kAudioHardwareNoError;
+}
 
 std::shared_ptr<aspl::Client> OutputHandler::OnAddClient(const aspl::ClientInfo& info)
 {

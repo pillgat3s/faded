@@ -1,10 +1,16 @@
 {
   "manifest_version": 3,
   "name": "Faded Tabs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Per-tab volume for Chrome and Brave. Give each tab its own level; sites remember where you left them.",
-  "permissions": ["storage", "tabs"],
-  "host_permissions": ["<all_urls>"],
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "icons": {
     "16": "icons/faded_16.png",
     "32": "icons/faded_32.png",
@@ -16,15 +22,23 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["page.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "page.js"
+      ],
       "run_at": "document_start",
       "all_frames": true,
       "world": "MAIN"
     },
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_start",
       "all_frames": true
     }

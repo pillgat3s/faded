@@ -33,8 +33,12 @@
     if (event.data && event.data.channel === CHANNEL_READY) pull();
   });
 
-  chrome.runtime.onMessage.addListener((message) => {
-    if (message && message.type === 'setGain') push(message.gain);
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (!message) return;
+    if (message.type === 'setGain') push(message.gain);
+    // Lets the popup distinguish "this tab has no hooks" from "the slider is
+    // working but you cannot hear it".
+    if (message.type === 'ping') sendResponse({ hooked: true });
   });
 
   // page.js and this script are both injected at document_start, one into each

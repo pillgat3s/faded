@@ -42,6 +42,8 @@ final class PlayThrough: @unchecked Sendable {
             throw AudioError.notFound("shared audio ring (driver not installed, or too old)")
         }
         outputDeviceID = output
+        // The ring publishes the rate the driver is actually producing at; the
+        // caller's value is only a fallback for a driver too old to publish it.
         self.sampleRate = reader.sampleRate ?? sampleRate
 
         do {

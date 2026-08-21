@@ -93,6 +93,58 @@ async function setGain(tabId, url, gain) {
 }
 
 // ---------------------------------------------------------------------------
+// Injecting into tabs that were already open
+//
+// Content scripts declared in the manifest only run on navigation, so every tab
+// that existed when the extension was installed or reloaded has no hooks in it
+// and its slider does nothing. Rather than telling people to reload their tabs,
+// inject into them explicitly.
+// ---------------------------------------------------------------------------
+
+async function injectExistingTabs() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] });
+  } catch (_) {
+    return;
+  }
+  for (const tab of tabs) {
+    if (tab.id === undefined) continue;
+    try {
+      // MAIN first, matching the manifest order: page.js installs the hooks,
+      // content.js then asks the service worker for this tab's level.
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
+        files: ['page.js'],
+        world: 'MAIN',
+        injectImmediately: true,
+      });
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
+        files: ['content.js'],
+        world: 'ISOLATED',
+        injectImmediately: true,
+      });
+    } catch (_) {
+      // Chrome Web Store, chrome:// pages, PDFs, discarded tabs — all expected.
+    }
+  }
+}
+
+chrome.runtime.onInstalled.addListener(injectExistingTabs);
+chrome.runtime.onStartup.addListener(injectExistingTabs);
+
+/// Is a tab hooked? Used to warn in the popup rather than fail silently.
+async function isHooked(tabId) {
+  try {
+    const reply = await chrome.tabs.sendMessage(tabId, { type: 'ping' }, { frameId: 0 });
+    return reply?.hooked === true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 
@@ -127,6 +179,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             active: tab.id === active?.id,
             gain: await gainFor(tab.id, tab.url || ''),
             adjustable: !!originOf(tab.url || ''),
+            hooked: originOf(tab.url || '') ? await isHooked(tab.id) : true,
           });
         }
         // Active tab first, then whatever is making noise.
