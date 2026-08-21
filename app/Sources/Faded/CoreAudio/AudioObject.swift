@@ -1,6 +1,6 @@
 // AudioObject.swift — thin, typed wrappers over the CoreAudio HAL C API.
 //
-// Everything in Fader that touches CoreAudio goes through here so the rest of
+// Everything in Faded that touches CoreAudio goes through here so the rest of
 // the app never sees UnsafeMutableRawPointer arithmetic.
 
 import CoreAudio
@@ -180,7 +180,7 @@ enum AudioSystem {
     }
 
     /// Resolves a device UID → AudioDeviceID. Works for *hidden* devices too,
-    /// which is how the app finds "Fader Tap".
+    /// which is how the app finds "Faded Tap".
     static func deviceID(forUID uid: String) -> AudioDeviceID? {
         var addr = AudioObjectPropertyAddress(kAudioHardwarePropertyTranslateUIDToDevice)
         var cfUID: Unmanaged<CFString>? = Unmanaged.passUnretained(uid as CFString)

@@ -1,29 +1,29 @@
-// FaderDriver — CoreAudio AudioServerPlugIn (HAL driver) for Fader.app.
+// FadedDriver — CoreAudio AudioServerPlugIn (HAL driver) for Faded.app.
 //
 // Two virtual devices in one plug-in:
 //
-//   "Fader"      visible OUTPUT device. Apps play into it. It exposes a real
+//   "Faded"      visible OUTPUT device. Apps play into it. It exposes a real
 //                volume + mute control, so macOS's Sound slider, the menu bar
 //                sound item and the F11/F12 keys all "just work" on it — that
 //                is what makes hardware-volume-less devices (Astro A50 base
 //                station, most USB DACs, HDMI) controllable from the keyboard.
 //
-//   "Fader Tap"  HIDDEN input device. Fader.app reads the mixed, processed
+//   "Faded Tap"  HIDDEN input device. Faded.app reads the mixed, processed
 //                output back from it and plays it to the real target device
 //                (built-in speakers, AirPods, Astro, AirPlay…). Hidden means
 //                Discord/Zoom/etc. never see a fake microphone.
 //
-// Processing chain per I/O cycle on the Fader device (all real-time thread):
+// Processing chain per I/O cycle on the Faded device (all real-time thread):
 //
 //   client A ─┐  OnProcessClientOutput: × per-app gain, peak meter
 //   client B ─┼─► libASPL mixes ─► OnProcessMixedOutput: × master vol / mute
 //   client C ─┘                     (unless bypassed) ─► OnWriteMixedOutput ─► FIFO
 //
-//   Fader Tap: OnReadClientInput ◄─ FIFO
+//   Faded Tap: OnReadClientInput ◄─ FIFO
 //
-// App <-> driver control goes through custom properties on the Fader device
-// (see FaderProtocol.h). Built on libASPL (MIT) which handles the enormous
-// AudioServerPlugIn boilerplate; this file is only the Fader-specific logic.
+// App <-> driver control goes through custom properties on the Faded device
+// (see FadedProtocol.h). Built on libASPL (MIT) which handles the enormous
+// AudioServerPlugIn boilerplate; this file is only the Faded-specific logic.
 
 #include <aspl/Driver.hpp>
 
@@ -38,8 +38,8 @@
 #include <string>
 #include <vector>
 
-#include "FaderFIFO.hpp"
-#include "FaderProtocol.h"
+#include "FadedFIFO.hpp"
+#include "FadedProtocol.h"
 
 namespace {
 
@@ -98,8 +98,8 @@ AudioStreamBasicDescription floatFormat(Float64 rate)
     f.mFormatID = kAudioFormatLinearPCM;
     f.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked;
     f.mBitsPerChannel = 32;
-    f.mChannelsPerFrame = kFaderChannelCount;
-    f.mBytesPerFrame = sizeof(Float32) * kFaderChannelCount;
+    f.mChannelsPerFrame = kFadedChannelCount;
+    f.mBytesPerFrame = sizeof(Float32) * kFadedChannelCount;
     f.mFramesPerPacket = 1;
     f.mBytesPerPacket = f.mBytesPerFrame;
     return f;
@@ -108,16 +108,16 @@ AudioStreamBasicDescription floatFormat(Float64 rate)
 std::vector<AudioValueRange> supportedRates()
 {
     auto r = [](double v) { return AudioValueRange{v, v}; };
-    return {r(kFaderSampleRate44k), r(kFaderSampleRate48k), r(kFaderSampleRate88k), r(kFaderSampleRate96k)};
+    return {r(kFadedSampleRate44k), r(kFadedSampleRate48k), r(kFadedSampleRate88k), r(kFadedSampleRate96k)};
 }
 
 // ---------------------------------------------------------------------------
 // Per-client state
 // ---------------------------------------------------------------------------
 
-class FaderClient : public aspl::Client {
+class FadedClient : public aspl::Client {
 public:
-    explicit FaderClient(const aspl::ClientInfo& info)
+    explicit FadedClient(const aspl::ClientInfo& info)
         : aspl::Client(info)
     {
         key_ = info.BundleID.empty() ? ("pid:" + std::to_string(info.ProcessID)) : info.BundleID;
@@ -133,14 +133,14 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// The Fader output device
+// The Faded output device
 // ---------------------------------------------------------------------------
 
-class FaderOutputDevice;
+class FadedOutputDevice;
 
 class OutputHandler : public aspl::ControlRequestHandler, public aspl::IORequestHandler {
 public:
-    void attach(std::weak_ptr<FaderOutputDevice> device) { device_ = std::move(device); }
+    void attach(std::weak_ptr<FadedOutputDevice> device) { device_ = std::move(device); }
 
     // -- clients (control thread) --------------------------------------
 
@@ -151,7 +151,7 @@ public:
 
     OSStatus OnStartIO() override
     {
-        fader::FIFO::shared().reset();
+        faded::FIFO::shared().reset();
         running_.store(true, std::memory_order_relaxed);
         return kAudioHardwareNoError;
     }
@@ -168,7 +168,7 @@ public:
         UInt32 frameCount,
         UInt32 channelCount) override
     {
-        auto* fc = static_cast<FaderClient*>(client.get());
+        auto* fc = static_cast<FadedClient*>(client.get());
         const float gain = fc->gain.load(std::memory_order_relaxed);
         const UInt32 n = frameCount * channelCount;
 
@@ -197,7 +197,7 @@ public:
         UInt32 frameCount,
         UInt32 channelCount) override
     {
-        // When bypassed, Fader.app mirrors the volume/mute controls onto the
+        // When bypassed, Faded.app mirrors the volume/mute controls onto the
         // real device's hardware gain instead, so we must NOT attenuate here.
         if (!bypassMaster.load(std::memory_order_relaxed)) {
             stream->ApplyProcessing(frames, frameCount, channelCount);
@@ -210,8 +210,8 @@ public:
         const void* bytes,
         UInt32 bytesCount) override
     {
-        fader::FIFO::shared().write(static_cast<const float*>(bytes),
-            bytesCount / (sizeof(Float32) * kFaderChannelCount));
+        faded::FIFO::shared().write(static_cast<const float*>(bytes),
+            bytesCount / (sizeof(Float32) * kFadedChannelCount));
     }
 
     // -- app-facing state ---------------------------------------------
@@ -224,13 +224,13 @@ public:
     std::map<std::string, float> gains;
 
 private:
-    std::weak_ptr<FaderOutputDevice> device_;
+    std::weak_ptr<FadedOutputDevice> device_;
     std::atomic<bool> running_{false};
 };
 
-class FaderOutputDevice : public aspl::Device {
+class FadedOutputDevice : public aspl::Device {
 public:
-    FaderOutputDevice(std::shared_ptr<const aspl::Context> context,
+    FadedOutputDevice(std::shared_ptr<const aspl::Context> context,
         const aspl::DeviceParameters& params,
         std::shared_ptr<OutputHandler> handler)
         : aspl::Device(std::move(context), params)
@@ -239,18 +239,18 @@ public:
         SetControlHandler(handler_);
         SetIOHandler(handler_);
 
-        RegisterCustomProperty(kFaderProp_Version,
-            [] { return makeCFString(kFaderProtocolVersion); });
+        RegisterCustomProperty(kFadedProp_Version,
+            [] { return makeCFString(kFadedProtocolVersion); });
 
-        RegisterCustomProperty(kFaderProp_Clients,
+        RegisterCustomProperty(kFadedProp_Clients,
             std::function<CFPropertyListRef()>([this] { return copyClientList(); }),
             std::function<void(CFPropertyListRef)>{});
 
-        RegisterCustomProperty(kFaderProp_AppGains,
+        RegisterCustomProperty(kFadedProp_AppGains,
             std::function<CFPropertyListRef()>([this] { return copyAppGains(); }),
             std::function<void(CFPropertyListRef)>([this](CFPropertyListRef v) { setAppGains(v); }));
 
-        RegisterCustomProperty(kFaderProp_BypassMaster,
+        RegisterCustomProperty(kFadedProp_BypassMaster,
             std::function<CFPropertyListRef()>([this] {
                 CFBooleanRef b = handler_->bypassMaster.load() ? kCFBooleanTrue : kCFBooleanFalse;
                 CFRetain(b);
@@ -259,11 +259,11 @@ public:
             std::function<void(CFPropertyListRef)>([this](CFPropertyListRef v) {
                 if (v && CFGetTypeID(v) == CFBooleanGetTypeID()) {
                     handler_->bypassMaster.store(CFBooleanGetValue(static_cast<CFBooleanRef>(v)));
-                    NotifyPropertyChanged(kFaderProp_BypassMaster);
+                    NotifyPropertyChanged(kFadedProp_BypassMaster);
                 }
             }));
 
-        RegisterCustomProperty(kFaderProp_HideOutput,
+        RegisterCustomProperty(kFadedProp_HideOutput,
             std::function<CFPropertyListRef()>([this] {
                 CFBooleanRef b = GetIsHidden() ? kCFBooleanTrue : kCFBooleanFalse;
                 CFRetain(b);
@@ -272,17 +272,17 @@ public:
             std::function<void(CFPropertyListRef)>([this](CFPropertyListRef v) {
                 if (v && CFGetTypeID(v) == CFBooleanGetTypeID()) {
                     SetIsHidden(CFBooleanGetValue(static_cast<CFBooleanRef>(v)));
-                    NotifyPropertyChanged(kFaderProp_HideOutput);
+                    NotifyPropertyChanged(kFadedProp_HideOutput);
                 }
             }));
 
-        RegisterCustomProperty(kFaderProp_Stats,
+        RegisterCustomProperty(kFadedProp_Stats,
             std::function<CFPropertyListRef()>([this] { return copyStats(); }),
             std::function<void(CFPropertyListRef)>{});
     }
 
     // Called by the handler when clients come and go.
-    void clientsChanged() { NotifyPropertyChanged(kFaderProp_Clients); }
+    void clientsChanged() { NotifyPropertyChanged(kFadedProp_Clients); }
 
     // Look up the stored gain for a client key (control thread).
     float gainFor(const std::string& key)
@@ -299,7 +299,7 @@ private:
     {
         CFMutableArrayRef arr = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
         for (const auto& c : GetClients()) {
-            auto* fc = static_cast<FaderClient*>(c.get());
+            auto* fc = static_cast<FadedClient*>(c.get());
             CFMutableDictionaryRef d = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
                 &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
             dictSet(d, "pid", makeCFNumber(static_cast<long long>(fc->GetProcessID())));
@@ -358,15 +358,15 @@ private:
         }
         // Push onto live clients.
         for (const auto& c : GetClients()) {
-            auto* fc = static_cast<FaderClient*>(c.get());
+            auto* fc = static_cast<FadedClient*>(c.get());
             fc->gain.store(gainFor(fc->key()), std::memory_order_relaxed);
         }
-        NotifyPropertyChanged(kFaderProp_AppGains);
+        NotifyPropertyChanged(kFadedProp_AppGains);
     }
 
     CFPropertyListRef copyStats()
     {
-        auto& fifo = fader::FIFO::shared();
+        auto& fifo = faded::FIFO::shared();
         CFMutableDictionaryRef d = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
             &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         dictSet(d, "fifoFrames", makeCFNumber(static_cast<long long>(fifo.availableFrames())));
@@ -390,7 +390,7 @@ private:
 
 std::shared_ptr<aspl::Client> OutputHandler::OnAddClient(const aspl::ClientInfo& info)
 {
-    auto client = std::make_shared<FaderClient>(info);
+    auto client = std::make_shared<FadedClient>(info);
     if (auto dev = device_.lock()) {
         client->gain.store(dev->gainFor(client->key()), std::memory_order_relaxed);
         dev->clientsChanged();
@@ -425,8 +425,8 @@ public:
         void* bytes,
         UInt32 bytesCount) override
     {
-        fader::FIFO::shared().read(static_cast<float*>(bytes),
-            bytesCount / (sizeof(Float32) * kFaderChannelCount));
+        faded::FIFO::shared().read(static_cast<float*>(bytes),
+            bytesCount / (sizeof(Float32) * kFadedChannelCount));
     }
 
     std::atomic<bool> running{false};
@@ -436,26 +436,26 @@ public:
 // Assembly
 // ---------------------------------------------------------------------------
 
-std::shared_ptr<aspl::Driver> CreateFaderDriver()
+std::shared_ptr<aspl::Driver> CreateFadedDriver()
 {
-#ifdef FADER_DEBUG_TRACE
+#ifdef FADED_DEBUG_TRACE
     auto tracer = std::make_shared<aspl::Tracer>(aspl::Tracer::Mode::Syslog, aspl::Tracer::Style::Flat);
 #else
     auto tracer = std::make_shared<aspl::Tracer>(aspl::Tracer::Mode::Noop);
 #endif
     auto context = std::make_shared<aspl::Context>(tracer);
 
-    // ---- Fader (output) ----
+    // ---- Faded (output) ----
     aspl::DeviceParameters outParams;
-    outParams.Name = kFaderOutputDeviceName;
-    outParams.Manufacturer = kFaderManufacturer;
-    outParams.DeviceUID = kFaderOutputDeviceUID;
-    outParams.ModelUID = kFaderModelUID;
-    outParams.ConfigurationApplicationBundleID = kFaderAppBundleID;
+    outParams.Name = kFadedOutputDeviceName;
+    outParams.Manufacturer = kFadedManufacturer;
+    outParams.DeviceUID = kFadedOutputDeviceUID;
+    outParams.ModelUID = kFadedModelUID;
+    outParams.ConfigurationApplicationBundleID = kFadedAppBundleID;
     outParams.CanBeDefault = true;
     outParams.CanBeDefaultForSystemSounds = true;
-    outParams.SampleRate = kFaderDefaultSampleRate;
-    outParams.ChannelCount = kFaderChannelCount;
+    outParams.SampleRate = kFadedDefaultSampleRate;
+    outParams.ChannelCount = kFadedChannelCount;
     outParams.EnableMixing = true;
     // Report a small, honest latency so apps' A/V sync accounts for the hop
     // through the app. Real total ≈ FIFO prime + two AUHAL buffers.
@@ -464,25 +464,25 @@ std::shared_ptr<aspl::Driver> CreateFaderDriver()
     outParams.ZeroTimeStampPeriod = 512;
 
     auto outHandler = std::make_shared<OutputHandler>();
-    auto outDevice = std::make_shared<FaderOutputDevice>(context, outParams, outHandler);
+    auto outDevice = std::make_shared<FadedOutputDevice>(context, outParams, outHandler);
     outHandler->attach(outDevice);
 
     aspl::StreamParameters outStream;
     outStream.Direction = aspl::Direction::Output;
-    outStream.Format = floatFormat(kFaderDefaultSampleRate);
+    outStream.Format = floatFormat(kFadedDefaultSampleRate);
     outDevice->AddStreamWithControlsAsync(outStream); // stream + volume + mute
     outDevice->SetAvailableSampleRatesAsync(supportedRates());
 
-    // ---- Fader Tap (input, hidden) ----
+    // ---- Faded Tap (input, hidden) ----
     aspl::DeviceParameters tapParams;
-    tapParams.Name = kFaderTapDeviceName;
-    tapParams.Manufacturer = kFaderManufacturer;
-    tapParams.DeviceUID = kFaderTapDeviceUID;
-    tapParams.ModelUID = kFaderModelUID;
+    tapParams.Name = kFadedTapDeviceName;
+    tapParams.Manufacturer = kFadedManufacturer;
+    tapParams.DeviceUID = kFadedTapDeviceUID;
+    tapParams.ModelUID = kFadedModelUID;
     tapParams.CanBeDefault = false;
     tapParams.CanBeDefaultForSystemSounds = false;
-    tapParams.SampleRate = kFaderDefaultSampleRate;
-    tapParams.ChannelCount = kFaderChannelCount;
+    tapParams.SampleRate = kFadedDefaultSampleRate;
+    tapParams.ChannelCount = kFadedChannelCount;
     tapParams.EnableMixing = false;
     tapParams.SafetyOffset = 64;
     tapParams.ZeroTimeStampPeriod = 512;
@@ -494,10 +494,10 @@ std::shared_ptr<aspl::Driver> CreateFaderDriver()
 
     aspl::StreamParameters tapStream;
     tapStream.Direction = aspl::Direction::Input;
-    tapStream.Format = floatFormat(kFaderDefaultSampleRate);
+    tapStream.Format = floatFormat(kFadedDefaultSampleRate);
     tapDevice->AddStreamAsync(tapStream);
     tapDevice->SetAvailableSampleRatesAsync(supportedRates());
-#ifndef FADER_TAP_VISIBLE
+#ifndef FADED_TAP_VISIBLE
     tapDevice->SetIsHidden(true);
 #endif
 
@@ -505,7 +505,7 @@ std::shared_ptr<aspl::Driver> CreateFaderDriver()
 
     // ---- plug-in ----
     aspl::PluginParameters pluginParams;
-    pluginParams.Manufacturer = kFaderManufacturer;
+    pluginParams.Manufacturer = kFadedManufacturer;
     pluginParams.ResourceBundlePath = "";
     auto plugin = std::make_shared<aspl::Plugin>(context, pluginParams);
     plugin->AddDevice(outDevice);
@@ -516,11 +516,11 @@ std::shared_ptr<aspl::Driver> CreateFaderDriver()
 
 } // namespace
 
-extern "C" __attribute__((visibility("default"))) void* FaderDriverEntryPoint(CFAllocatorRef /*allocator*/, CFUUIDRef typeUUID)
+extern "C" __attribute__((visibility("default"))) void* FadedDriverEntryPoint(CFAllocatorRef /*allocator*/, CFUUIDRef typeUUID)
 {
     if (!CFEqual(typeUUID, kAudioServerPlugInTypeUUID)) {
         return nullptr;
     }
-    static std::shared_ptr<aspl::Driver> driver = CreateFaderDriver();
+    static std::shared_ptr<aspl::Driver> driver = CreateFadedDriver();
     return driver->GetReference();
 }

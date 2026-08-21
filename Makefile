@@ -1,9 +1,9 @@
-# Fader — build orchestration.
+# Faded — build orchestration.
 #
-#   make            → driver + app (Release), result in build/Fader.app
-#   make driver     → build the HAL plug-in only (driver/build/FaderDriver.driver)
+#   make            → driver + app (Release), result in build/Faded.app
+#   make driver     → build the HAL plug-in only (driver/build/FadedDriver.driver)
 #   make app        → xcodegen + xcodebuild the app (embeds the driver)
-#   make install    → copy Fader.app to /Applications and open it (the app
+#   make install    → copy Faded.app to /Applications and open it (the app
 #                     installs the driver itself with an admin prompt)
 #   make install-driver / uninstall-driver → do the driver part from the shell
 #   make uninstall  → remove app + driver + prefs (asks for password)
@@ -27,37 +27,37 @@ all: driver app
 driver:
 	cmake -S $(DRIVER_DIR) -B $(DRIVER_DIR)/build -DCMAKE_BUILD_TYPE=Release -DCODESIGN_ID="$(CODESIGN_ID)" -Wno-dev
 	cmake --build $(DRIVER_DIR)/build -j8
-	@codesign --verify --strict $(DRIVER_DIR)/build/FaderDriver.driver && echo "driver ok: $(DRIVER_DIR)/build/FaderDriver.driver"
+	@codesign --verify --strict $(DRIVER_DIR)/build/FadedDriver.driver && echo "driver ok: $(DRIVER_DIR)/build/FadedDriver.driver"
 
 app: driver check-protocol
 	cd $(APP_DIR) && xcodegen generate
-	cd $(APP_DIR) && xcodebuild -project Fader.xcodeproj -scheme Fader -configuration $(CONFIG) \
-	    -derivedDataPath build build | grep -E "error|warning: .*Sources/Fader|BUILD" || true
+	cd $(APP_DIR) && xcodebuild -project Faded.xcodeproj -scheme Faded -configuration $(CONFIG) \
+	    -derivedDataPath build build | grep -E "error|warning: .*Sources/Faded|BUILD" || true
 	@mkdir -p $(OUT)
-	@rm -rf $(OUT)/Fader.app
-	@cp -R $(APP_DIR)/build/Build/Products/$(CONFIG)/Fader.app $(OUT)/
-	@echo "app ok: $(OUT)/Fader.app"
+	@rm -rf $(OUT)/Faded.app
+	@cp -R $(APP_DIR)/build/Build/Products/$(CONFIG)/Faded.app $(OUT)/
+	@echo "app ok: $(OUT)/Faded.app"
 
 install: app
-	@rm -rf /Applications/Fader.app
-	cp -R $(OUT)/Fader.app /Applications/
-	open /Applications/Fader.app
-	@echo "Fader is running in the menu bar. Click it → Install Driver…"
+	@rm -rf /Applications/Faded.app
+	cp -R $(OUT)/Faded.app /Applications/
+	open /Applications/Faded.app
+	@echo "Faded is running in the menu bar. Click it → Install Driver…"
 
 install-driver: driver
-	sudo $(ROOT)/scripts/install-driver.sh $(DRIVER_DIR)/build/FaderDriver.driver
+	sudo $(ROOT)/scripts/install-driver.sh $(DRIVER_DIR)/build/FadedDriver.driver
 
 uninstall-driver:
 	sudo $(ROOT)/scripts/uninstall-driver.sh
 
 uninstall:
-	-osascript -e 'tell application "Fader" to quit' 2>/dev/null
-	-rm -rf /Applications/Fader.app
-	-defaults delete com.andri.fader 2>/dev/null
+	-osascript -e 'tell application "Faded" to quit' 2>/dev/null
+	-rm -rf /Applications/Faded.app
+	-defaults delete com.andri.faded 2>/dev/null
 	sudo $(ROOT)/scripts/uninstall-driver.sh
 
 check-protocol:
 	@$(ROOT)/scripts/check-protocol.sh
 
 clean:
-	rm -rf $(DRIVER_DIR)/build $(APP_DIR)/build $(APP_DIR)/Fader.xcodeproj $(OUT)
+	rm -rf $(DRIVER_DIR)/build $(APP_DIR)/build $(APP_DIR)/Faded.xcodeproj $(OUT)

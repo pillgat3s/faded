@@ -1,10 +1,10 @@
-// FaderApp.swift — menu bar–only app entry point.
+// FadedApp.swift — menu bar–only app entry point.
 
 import AppKit
 import SwiftUI
 
 @main
-struct FaderApp: App {
+struct FadedApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {

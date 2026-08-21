@@ -2,7 +2,7 @@
 build/
 driver/build/
 app/build/
-app/Fader.xcodeproj/
+app/Faded.xcodeproj/
 # xcode
 xcuserdata/
 *.xcuserstate

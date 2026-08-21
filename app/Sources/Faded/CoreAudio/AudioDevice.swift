@@ -1,5 +1,5 @@
 // AudioDevice.swift — a value-type snapshot of one CoreAudio device plus the
-// handful of live operations Fader needs (volume, mute, sample rate).
+// handful of live operations Faded needs (volume, mute, sample rate).
 
 import AudioToolbox
 import CoreAudio
@@ -69,12 +69,12 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
         AudioSystem.allDeviceIDs().compactMap(AudioDevice.init(id:))
     }
 
-    /// Output-capable, non-hidden devices, excluding Fader's own virtual ones.
+    /// Output-capable, non-hidden devices, excluding Faded's own virtual ones.
     static func selectableOutputs() -> [AudioDevice] {
-        all().filter { $0.hasOutput && !$0.isHidden && !$0.isFaderDevice }
+        all().filter { $0.hasOutput && !$0.isHidden && !$0.isFadedDevice }
     }
 
-    var isFaderDevice: Bool { uid == FaderProtocol.outputDeviceUID || uid == FaderProtocol.tapDeviceUID }
+    var isFadedDevice: Bool { uid == FadedProtocol.outputDeviceUID || uid == FadedProtocol.tapDeviceUID }
 
     var isAlive: Bool {
         let alive: UInt32 = (try? AudioObject.get(id, .init(kAudioDevicePropertyDeviceIsAlive))) ?? 0

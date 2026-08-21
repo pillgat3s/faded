@@ -1,6 +1,6 @@
 #!/usr/bin/env swift
-// Generates Fader's app icon into
-// app/Sources/Fader/Resources/Assets.xcassets/AppIcon.appiconset.
+// Generates Faded's app icon into
+// app/Sources/Faded/Resources/Assets.xcassets/AppIcon.appiconset.
 //
 // Run from the repo root:  swift scripts/make_app_icon.swift
 //
@@ -12,7 +12,7 @@
 import AppKit
 
 let sizes = [16, 32, 64, 128, 256, 512, 1024]
-let outDir = URL(fileURLWithPath: "app/Sources/Fader/Resources/Assets.xcassets/AppIcon.appiconset")
+let outDir = URL(fileURLWithPath: "app/Sources/Faded/Resources/Assets.xcassets/AppIcon.appiconset")
 
 func draw(px: Int) -> NSBitmapImageRep {
     let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px, bitsPerSample: 8,
@@ -31,7 +31,7 @@ func draw(px: Int) -> NSBitmapImageRep {
     let g = NSGradient(colors: [NSColor(calibratedWhite: 0.13, alpha: 1), NSColor(calibratedWhite: 0.05, alpha: 1)])!
     g.draw(in: tile, angle: -90)
 
-    // Three vertical fader tracks.
+    // Three vertical fader tracks (the app is named for the fade, the icon shows the faders).
     let trackW = s * 0.055
     let trackH = s * 0.52
     let baseY = (s - trackH) / 2

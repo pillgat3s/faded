@@ -1,7 +1,7 @@
-// DriverInstaller.swift — installs / removes FaderDriver.driver from inside
+// DriverInstaller.swift — installs / removes FadedDriver.driver from inside
 // the app.
 //
-// The .driver bundle is embedded in Fader.app/Contents/Resources. Installing
+// The .driver bundle is embedded in Faded.app/Contents/Resources. Installing
 // means copying it to /Library/Audio/Plug-Ins/HAL and restarting coreaudiod;
 // both need root, so we run one shell command through AppleScript's
 // "with administrator privileges" — macOS shows its native password dialog,
@@ -13,14 +13,14 @@ import os
 
 @MainActor
 enum DriverInstaller {
-    private static let log = Logger(subsystem: FaderProtocol.appBundleID, category: "Installer")
+    private static let log = Logger(subsystem: FadedProtocol.appBundleID, category: "Installer")
 
     static let installDir = "/Library/Audio/Plug-Ins/HAL"
-    static let bundleName = "FaderDriver.driver"
+    static let bundleName = "FadedDriver.driver"
     static var installedPath: String { "\(installDir)/\(bundleName)" }
 
     static var embeddedDriverURL: URL? {
-        Bundle.main.url(forResource: "FaderDriver", withExtension: "driver")
+        Bundle.main.url(forResource: "FadedDriver", withExtension: "driver")
     }
 
     static var isInstalled: Bool { FileManager.default.fileExists(atPath: installedPath) }
@@ -44,7 +44,7 @@ enum DriverInstaller {
         case failed(String)
         var errorDescription: String? {
             switch self {
-            case .noEmbeddedDriver: "This build of Fader has no driver embedded (build with `make app`)."
+            case .noEmbeddedDriver: "This build of Faded has no driver embedded (build with `make app`)."
             case .cancelled: "Cancelled."
             case let .failed(m): m
             }

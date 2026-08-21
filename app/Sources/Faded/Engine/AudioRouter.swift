@@ -3,15 +3,15 @@
 // mirroring, per-app gains and persistence.
 //
 // Invariants while engaged:
-//   * macOS default output == "Fader" (so every app plays into the driver).
-//   * `target` is the real device Fader.app plays to.
-//   * The Fader device's volume/mute controls always show the *target's*
+//   * macOS default output == "Faded" (so every app plays into the driver).
+//   * `target` is the real device Faded.app plays to.
+//   * The Faded device's volume/mute controls always show the *target's*
 //     level. If the target has hardware volume we mirror the value onto it and
 //     tell the driver to bypass its own gain (no double attenuation); if it
 //     doesn't (Astro A50 & friends) the driver applies the gain in software.
 //   * When macOS or the user changes the default output to something else
 //     (Control Center, AirPods auto-switch, AirPlay pick), we adopt that
-//     device as the new target and put Fader back as default. That is what
+//     device as the new target and put Faded back as default. That is what
 //     keeps AirPlay/AirPods "native".
 
 import AppKit
@@ -23,7 +23,7 @@ import os
 @MainActor
 @Observable
 final class AudioRouter {
-    private static let log = Logger(subsystem: FaderProtocol.appBundleID, category: "Router")
+    private static let log = Logger(subsystem: FadedProtocol.appBundleID, category: "Router")
 
     // MARK: Observable state
 
@@ -36,7 +36,7 @@ final class AudioRouter {
     private(set) var isEngaged = false
     private(set) var lastError: String?
 
-    /// User switch: route audio through Fader (true) or leave macOS alone.
+    /// User switch: route audio through Faded (true) or leave macOS alone.
     var enabled: Bool {
         didSet {
             defaults.set(enabled, forKey: Keys.enabled)
@@ -44,12 +44,12 @@ final class AudioRouter {
         }
     }
 
-    /// Experimental: hide the "Fader" device from Sound settings / Control
+    /// Experimental: hide the "Faded" device from Sound settings / Control
     /// Center. Only useful if macOS still lets us make it the default output;
     /// `engage()` verifies that and flips this back off if it doesn't.
-    var hideFaderDevice: Bool {
+    var hideFadedDevice: Bool {
         didSet {
-            defaults.set(hideFaderDevice, forKey: Keys.hideFader)
+            defaults.set(hideFadedDevice, forKey: Keys.hideFaded)
             applyHiddenPreference()
         }
     }
@@ -76,7 +76,7 @@ final class AudioRouter {
 
     private var defaultOutputListener: ListenerToken?
     private var deviceListListener: ListenerToken?
-    private var faderControlListeners: [ListenerToken] = []
+    private var fadedControlListeners: [ListenerToken] = []
     private var targetControlListeners: [ListenerToken] = []
     private var targetRateListener: ListenerToken?
     private var meterTimer: Timer?
@@ -99,12 +99,12 @@ final class AudioRouter {
         static let appMutedLevels = "appMutedLevels"
         static let lastTarget = "lastTargetUID"
         static let previousTargets = "previousTargets"
-        static let hideFader = "hideFaderDevice"
+        static let hideFaded = "hideFadedDevice"
     }
 
     init() {
         enabled = defaults.object(forKey: Keys.enabled) as? Bool ?? true
-        hideFaderDevice = defaults.bool(forKey: Keys.hideFader)
+        hideFadedDevice = defaults.bool(forKey: Keys.hideFaded)
         volumeByDevice = defaults.dictionary(forKey: Keys.volumeByDevice) as? [String: Float] ?? [:]
         mutedByDevice = defaults.dictionary(forKey: Keys.mutedByDevice) as? [String: Bool] ?? [:]
         appGains = defaults.dictionary(forKey: Keys.appGains) as? [String: Float] ?? [:]
@@ -129,7 +129,7 @@ final class AudioRouter {
     // MARK: Engage / disengage
 
     func engage() {
-        guard !isEngaged, driver.isReady, let fader = driver.outputDevice, let tapID = driver.tapDeviceID else {
+        guard !isEngaged, driver.isReady, let faded = driver.outputDevice, let tapID = driver.tapDeviceID else {
             driverStatus = driver.status
             return
         }
@@ -137,7 +137,7 @@ final class AudioRouter {
 
         // Decide the initial target.
         let systemDefault = AudioSystem.defaultOutputDevice.flatMap(AudioDevice.init(id:))
-        let initial: AudioDevice? = if let d = systemDefault, !d.isFaderDevice, d.hasOutput {
+        let initial: AudioDevice? = if let d = systemDefault, !d.isFadedDevice, d.hasOutput {
             d
         } else if let uid = defaults.string(forKey: Keys.lastTarget), let d = outputs.first(where: { $0.uid == uid }) {
             d
@@ -158,14 +158,14 @@ final class AudioRouter {
             return
         }
         applyHiddenPreference()
-        setSystemDefault(to: fader.id)
-        if AudioSystem.defaultOutputDevice != fader.id, hideFaderDevice {
+        setSystemDefault(to: faded.id)
+        if AudioSystem.defaultOutputDevice != faded.id, hideFadedDevice {
             // macOS refused a hidden default — unhide and retry once.
-            Self.log.warning("hidden Fader device rejected as default output; unhiding")
-            hideFaderDevice = false
-            setSystemDefault(to: fader.id)
+            Self.log.warning("hidden Faded device rejected as default output; unhiding")
+            hideFadedDevice = false
+            setSystemDefault(to: faded.id)
         }
-        installFaderControlListeners()
+        installFadedControlListeners()
         installTargetListeners()
         pushAllAppGains()
         applyVolumeForTarget()
@@ -177,7 +177,7 @@ final class AudioRouter {
     func disengage(restoreDefault: Bool) {
         guard isEngaged else { return }
         engine.stop()
-        faderControlListeners.removeAll()
+        fadedControlListeners.removeAll()
         targetControlListeners.removeAll()
         targetRateListener = nil
         if restoreDefault, let t = target, t.isAlive {
@@ -194,13 +194,13 @@ final class AudioRouter {
 
     private func applyHiddenPreference() {
         guard driver.isReady else { return }
-        if driver.isOutputHidden != hideFaderDevice { driver.setOutputHidden(hideFaderDevice) }
+        if driver.isOutputHidden != hideFadedDevice { driver.setOutputHidden(hideFadedDevice) }
     }
 
     // MARK: Target selection
 
     func select(_ device: AudioDevice) {
-        guard device.hasOutput, !device.isFaderDevice else { return }
+        guard device.hasOutput, !device.isFadedDevice else { return }
         if !isEngaged {
             setSystemDefault(to: device.id)
             target = device
@@ -245,7 +245,7 @@ final class AudioRouter {
     /// resamples; otherwise 48 kHz and let AUHAL convert on the way out.
     private func engineRate(for device: AudioDevice) -> Double {
         let r = device.nominalSampleRate
-        return FaderProtocol.supportedSampleRates.contains(r) ? r : FaderProtocol.defaultSampleRate
+        return FadedProtocol.supportedSampleRates.contains(r) ? r : FadedProtocol.defaultSampleRate
     }
 
     private func fallbackDevice() -> AudioDevice? {
@@ -269,16 +269,16 @@ final class AudioRouter {
     }
 
     private func defaultOutputChanged() {
-        guard isEngaged, !settingDefault, let fader = driver.outputDevice else { return }
-        guard let current = AudioSystem.defaultOutputDevice, current != fader.id else { return }
+        guard isEngaged, !settingDefault, let faded = driver.outputDevice else { return }
+        guard let current = AudioSystem.defaultOutputDevice, current != faded.id else { return }
         // Someone (user via Control Center, AirPods auto-switch, AirPlay pick,
         // another app) pointed the system at a real device: adopt it, then take
         // the default back.
-        if let dev = AudioDevice(id: current), dev.hasOutput, !dev.isFaderDevice {
+        if let dev = AudioDevice(id: current), dev.hasOutput, !dev.isFadedDevice {
             Self.log.info("system default moved to \(dev.name) — following")
             retarget(dev)
         }
-        setSystemDefault(to: fader.id)
+        setSystemDefault(to: faded.id)
     }
 
     private func devicesChanged() {
@@ -315,7 +315,7 @@ final class AudioRouter {
     func setVolume(_ v: Float) {
         let clamped = min(max(v, 0), 1)
         if isEngaged {
-            driver.setFaderVolume(clamped) // listener mirrors to target + persists
+            driver.setFadedVolume(clamped) // listener mirrors to target + persists
             if clamped > 0, muted { setMuted(false) }
         } else if let t = target ?? AudioSystem.defaultOutputDevice.flatMap(AudioDevice.init(id:)) {
             t.setVolume(clamped)
@@ -325,20 +325,20 @@ final class AudioRouter {
 
     func setMuted(_ m: Bool) {
         if isEngaged {
-            driver.setFaderMuted(m)
+            driver.setFadedMuted(m)
         } else if let t = target ?? AudioSystem.defaultOutputDevice.flatMap(AudioDevice.init(id:)) {
             t.setMuted(m)
             muted = m
         }
     }
 
-    /// The Fader control (moved by keys/Sound slider/our UI) changed → mirror.
-    private func faderControlChanged() {
+    /// The Faded control (moved by keys/Sound slider/our UI) changed → mirror.
+    private func fadedControlChanged() {
         guard isEngaged, !syncingVolume, let t = target else { return }
         syncingVolume = true
         defer { syncingVolume = false }
-        let v = driver.faderVolume
-        let m = driver.faderMuted
+        let v = driver.fadedVolume
+        let m = driver.fadedMuted
         volume = v
         muted = m
         volumeByDevice[t.uid] = v
@@ -350,34 +350,34 @@ final class AudioRouter {
     }
 
     /// The *target's* hardware volume changed from elsewhere (AirPods stem,
-    /// another app) → reflect on the Fader control.
+    /// another app) → reflect on the Faded control.
     private func targetControlChanged() {
         guard isEngaged, !syncingVolume, let t = target, t.hasHardwareVolume else { return }
         syncingVolume = true
         defer { syncingVolume = false }
-        if let v = t.volume { driver.setFaderVolume(v); volume = v; volumeByDevice[t.uid] = v }
-        if let m = t.isMuted { driver.setFaderMuted(m); muted = m; mutedByDevice[t.uid] = m }
+        if let v = t.volume { driver.setFadedVolume(v); volume = v; volumeByDevice[t.uid] = v }
+        if let m = t.isMuted { driver.setFadedMuted(m); muted = m; mutedByDevice[t.uid] = m }
     }
 
-    /// New target: decide who owns the gain stage and seed the Fader control.
+    /// New target: decide who owns the gain stage and seed the Faded control.
     private func applyVolumeForTarget() {
         guard let t = target else { return }
         driver.setBypassMaster(t.hasHardwareVolume)
         syncingVolume = true
         let v: Float = t.hasHardwareVolume ? (t.volume ?? 1) : (volumeByDevice[t.uid] ?? 1)
         let m: Bool = t.hasHardwareMute ? (t.isMuted ?? false) : (mutedByDevice[t.uid] ?? false)
-        driver.setFaderVolume(v)
-        driver.setFaderMuted(m)
+        driver.setFadedVolume(v)
+        driver.setFadedMuted(m)
         volume = v
         muted = m
         syncingVolume = false
     }
 
-    private func installFaderControlListeners() {
-        guard let fader = driver.outputDevice else { return }
-        faderControlListeners = fader.volumeListenerAddresses.map { addr in
-            AudioObject.listen(fader.id, addr) { [weak self] in
-                Task { @MainActor in self?.faderControlChanged() }
+    private func installFadedControlListeners() {
+        guard let faded = driver.outputDevice else { return }
+        fadedControlListeners = faded.volumeListenerAddresses.map { addr in
+            AudioObject.listen(faded.id, addr) { [weak self] in
+                Task { @MainActor in self?.fadedControlChanged() }
             }
         }
     }

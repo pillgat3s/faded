@@ -1,7 +1,7 @@
-// PlayThrough.swift — moves audio from the hidden "Fader Tap" device to the
+// PlayThrough.swift — moves audio from the hidden "Faded Tap" device to the
 // real output device.
 //
-//   Fader Tap ──AUHAL(input)──▶ RingBuffer ──AUHAL(output)──▶ target device
+//   Faded Tap ──AUHAL(input)──▶ RingBuffer ──AUHAL(output)──▶ target device
 //
 // Two AUHAL units instead of AVAudioEngine because we need to pin each side to
 // a specific device and keep the real-time path trivial. The output AUHAL does
@@ -15,11 +15,11 @@ import Foundation
 import os
 
 final class PlayThrough: @unchecked Sendable {
-    private static let log = Logger(subsystem: FaderProtocol.appBundleID, category: "PlayThrough")
+    private static let log = Logger(subsystem: FadedProtocol.appBundleID, category: "PlayThrough")
 
     private var inputUnit: AudioUnit?
     private var outputUnit: AudioUnit?
-    private let ring = RingBuffer(channels: FaderProtocol.channelCount)
+    private let ring = RingBuffer(channels: FadedProtocol.channelCount)
     private var inputBufferList: UnsafeMutableAudioBufferListPointer?
     private var inputBufferCapacity: UInt32 = 0
     private(set) var isRunning = false
@@ -86,7 +86,7 @@ final class PlayThrough: @unchecked Sendable {
         f.mSampleRate = rate
         f.mFormatID = kAudioFormatLinearPCM
         f.mFormatFlags = kAudioFormatFlagsNativeFloatPacked // interleaved float32
-        f.mChannelsPerFrame = UInt32(FaderProtocol.channelCount)
+        f.mChannelsPerFrame = UInt32(FadedProtocol.channelCount)
         f.mBitsPerChannel = 32
         f.mBytesPerFrame = 4 * f.mChannelsPerFrame
         f.mFramesPerPacket = 1
@@ -110,7 +110,7 @@ final class PlayThrough: @unchecked Sendable {
         guard status == noErr else { throw AudioError.osStatus(status, what) }
     }
 
-    // MARK: Input side (reads from Fader Tap)
+    // MARK: Input side (reads from Faded Tap)
 
     private func startInput(device: AudioDeviceID, format: AudioStreamBasicDescription) throws {
         let unit = try Self.makeHALUnit()

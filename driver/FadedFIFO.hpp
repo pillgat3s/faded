@@ -1,6 +1,6 @@
-// FaderFIFO.hpp — single-producer / single-consumer ring buffer of interleaved
-// Float32 frames, shared between the "Fader" output device (writer, its I/O
-// thread) and the "Fader Tap" input device (reader, its I/O thread).
+// FadedFIFO.hpp — single-producer / single-consumer ring buffer of interleaved
+// Float32 frames, shared between the "Faded" output device (writer, its I/O
+// thread) and the "Faded Tap" input device (reader, its I/O thread).
 //
 // Both sides run on real-time threads, so: no locks, no allocation, no
 // syscalls. Positions are monotonically increasing frame counters; the buffer
@@ -23,7 +23,7 @@
 #include <cstring>
 #include <algorithm>
 
-namespace fader {
+namespace faded {
 
 class FIFO {
 public:
@@ -154,4 +154,4 @@ private:
     float buf_[kCapacityFrames * kChannels] = {};
 };
 
-} // namespace fader
+} // namespace faded

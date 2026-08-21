@@ -1,6 +1,6 @@
 // MenuView.swift — the popover under the menu bar icon. Laid out like the
 // macOS Control Center "Sound" module: title, big output slider, Output device
-// list with checkmarks, then Fader's additions (Apps) and a footer.
+// list with checkmarks, then Faded's additions (Apps) and a footer.
 
 import AppKit
 import ServiceManagement
@@ -96,7 +96,7 @@ struct MenuView: View {
             if router.outputs.isEmpty {
                 Text("No output devices").font(.system(size: 12)).foregroundStyle(.secondary).padding(.horizontal, 14)
             }
-            Text("AirPlay speakers: pick them in Control Center as usual — Fader follows.")
+            Text("AirPlay speakers: pick them in Control Center as usual — Faded follows.")
                 .font(.system(size: 10.5)).foregroundStyle(.tertiary)
                 .padding(.horizontal, 14).padding(.top, 4)
         }
@@ -131,7 +131,7 @@ struct MenuView: View {
             case .notInstalled:
                 Label("Audio driver not installed", systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 12, weight: .semibold))
-                Text("Fader needs a small system audio driver to control volume per app and on devices without a volume control. Installing asks for your password once and restarts the audio system (≈1 s of silence).")
+                Text("Faded needs a small system audio driver to control volume per app and on devices without a volume control. Installing asks for your password once and restarts the audio system (≈1 s of silence).")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                 Button("Install Driver…") { runInstall { try DriverInstaller.install() } }
                     .buttonStyle(.borderedProminent).controlSize(.small)
@@ -177,8 +177,8 @@ struct MenuView: View {
             .buttonStyle(.plain).font(.system(size: 12))
             Spacer()
             Menu {
-                Toggle("Route audio through Fader", isOn: $router.enabled)
-                Toggle("Hide “Fader” from device lists (experimental)", isOn: $router.hideFaderDevice)
+                Toggle("Route audio through Faded", isOn: $router.enabled)
+                Toggle("Hide “Faded” from device lists (experimental)", isOn: $router.hideFadedDevice)
                 Toggle("Launch at Login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, on in
                         do { on ? try SMAppService.mainApp.register() : try SMAppService.mainApp.unregister() }
@@ -195,7 +195,7 @@ struct MenuView: View {
                 }
                 Divider()
                 Button("Diagnostics…") { showDiagnostics = true }
-                Button("Quit Fader") { NSApp.terminate(nil) }
+                Button("Quit Faded") { NSApp.terminate(nil) }
             } label: {
                 Image(systemName: "gearshape").font(.system(size: 12))
             }

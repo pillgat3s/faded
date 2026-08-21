@@ -29,7 +29,7 @@
 	<key>CFPlugInFactories</key>
 	<dict>
 		<key>5C7B9D8E-3A31-4E48-9F0B-8F1D2C6A7E10</key>
-		<string>FaderDriverEntryPoint</string>
+		<string>FadedDriverEntryPoint</string>
 	</dict>
 	<key>CFPlugInTypes</key>
 	<dict>

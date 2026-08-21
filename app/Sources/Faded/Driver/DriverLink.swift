@@ -1,4 +1,4 @@
-// DriverLink.swift — the app's handle on the installed FaderDriver.
+// DriverLink.swift — the app's handle on the installed FadedDriver.
 //
 // Finds the two virtual devices, speaks the custom-property protocol, and
 // surfaces client (per-app) changes as a Swift async stream.
@@ -37,7 +37,7 @@ final class DriverLink {
 
     func refresh() {
         let previous = status
-        guard let outID = AudioSystem.deviceID(forUID: FaderProtocol.outputDeviceUID),
+        guard let outID = AudioSystem.deviceID(forUID: FadedProtocol.outputDeviceUID),
               let out = AudioDevice(id: outID)
         else {
             outputDevice = nil
@@ -48,17 +48,17 @@ final class DriverLink {
             return
         }
         outputDevice = out
-        tapDeviceID = AudioSystem.deviceID(forUID: FaderProtocol.tapDeviceUID)
+        tapDeviceID = AudioSystem.deviceID(forUID: FadedProtocol.tapDeviceUID)
 
-        let version = AudioObject.getString(outID, .init(FaderProtocol.Prop.version)) ?? "?"
-        if version != FaderProtocol.protocolVersion || tapDeviceID == nil {
+        let version = AudioObject.getString(outID, .init(FadedProtocol.Prop.version)) ?? "?"
+        if version != FadedProtocol.protocolVersion || tapDeviceID == nil {
             status = .incompatible(found: version)
         } else {
             status = .ready
         }
 
         if clientListener == nil || previous != status {
-            clientListener = AudioObject.listen(outID, .init(FaderProtocol.Prop.clients)) { [weak self] in
+            clientListener = AudioObject.listen(outID, .init(FadedProtocol.Prop.clients)) { [weak self] in
                 Task { @MainActor in self?.onClientsChanged?() }
             }
         }
@@ -71,7 +71,7 @@ final class DriverLink {
 
     func clients() -> [DriverClient] {
         guard let id = outputDevice?.id,
-              let list = try? AudioObject.getCF(id, .init(FaderProtocol.Prop.clients), as: CFArray.self) as? [[String: Any]]
+              let list = try? AudioObject.getCF(id, .init(FadedProtocol.Prop.clients), as: CFArray.self) as? [[String: Any]]
         else { return [] }
         return list.compactMap { d in
             guard let pid = d["pid"] as? Int, let client = d["client"] as? Int else { return nil }
@@ -86,7 +86,7 @@ final class DriverLink {
 
     func appGains() -> [String: Float] {
         guard let id = outputDevice?.id,
-              let dict = try? AudioObject.getCF(id, .init(FaderProtocol.Prop.appGains), as: CFDictionary.self) as? [String: Double]
+              let dict = try? AudioObject.getCF(id, .init(FadedProtocol.Prop.appGains), as: CFDictionary.self) as? [String: Double]
         else { return [:] }
         return dict.mapValues(Float.init)
     }
@@ -94,31 +94,31 @@ final class DriverLink {
     func setAppGains(_ gains: [String: Float]) {
         guard let id = outputDevice?.id else { return }
         let dict = gains.mapValues { Double($0) } as CFDictionary
-        try? AudioObject.setCF(id, .init(FaderProtocol.Prop.appGains), dict)
+        try? AudioObject.setCF(id, .init(FadedProtocol.Prop.appGains), dict)
     }
 
     func setBypassMaster(_ bypass: Bool) {
         guard let id = outputDevice?.id else { return }
-        try? AudioObject.setCF(id, .init(FaderProtocol.Prop.bypassMaster), (bypass ? kCFBooleanTrue : kCFBooleanFalse)!)
+        try? AudioObject.setCF(id, .init(FadedProtocol.Prop.bypassMaster), (bypass ? kCFBooleanTrue : kCFBooleanFalse)!)
     }
 
     func stats() -> [String: Any] {
         guard let id = outputDevice?.id,
-              let dict = try? AudioObject.getCF(id, .init(FaderProtocol.Prop.stats), as: CFDictionary.self) as? [String: Any]
+              let dict = try? AudioObject.getCF(id, .init(FadedProtocol.Prop.stats), as: CFDictionary.self) as? [String: Any]
         else { return [:] }
         return dict
     }
 
-    // MARK: Fader device volume/mute (the controls the OS drives)
+    // MARK: Faded device volume/mute (the controls the OS drives)
 
-    var faderVolume: Float {
+    var fadedVolume: Float {
         get { outputDevice?.volume ?? 1 }
     }
 
-    func setFaderVolume(_ v: Float) { outputDevice?.setVolume(v) }
+    func setFadedVolume(_ v: Float) { outputDevice?.setVolume(v) }
 
-    var faderMuted: Bool { outputDevice?.isMuted ?? false }
-    func setFaderMuted(_ m: Bool) { outputDevice?.setMuted(m) }
+    var fadedMuted: Bool { outputDevice?.isMuted ?? false }
+    func setFadedMuted(_ m: Bool) { outputDevice?.setMuted(m) }
 
     /// Set both virtual devices to `rate` and wait (≤ 1 s) for the switch to
     /// land — nominal-rate changes are asynchronous in the HAL and AUHAL
@@ -127,7 +127,7 @@ final class DriverLink {
     @discardableResult
     func setSampleRate(_ rate: Double) -> Double {
         guard let out = outputDevice, let tapID = tapDeviceID, let tap = AudioDevice(id: tapID) else { return rate }
-        guard FaderProtocol.supportedSampleRates.contains(rate) else { return tap.nominalSampleRate }
+        guard FadedProtocol.supportedSampleRates.contains(rate) else { return tap.nominalSampleRate }
         if abs(out.nominalSampleRate - rate) < 1, abs(tap.nominalSampleRate - rate) < 1 { return rate }
         try? out.setNominalSampleRate(rate)
         try? tap.setNominalSampleRate(rate)
@@ -140,20 +140,20 @@ final class DriverLink {
 
     /// Current rate of the Tap device (what the play-through must open at).
     var tapSampleRate: Double {
-        tapDeviceID.flatMap(AudioDevice.init(id:))?.nominalSampleRate ?? FaderProtocol.defaultSampleRate
+        tapDeviceID.flatMap(AudioDevice.init(id:))?.nominalSampleRate ?? FadedProtocol.defaultSampleRate
     }
 
-    // MARK: Experimental: hide the Fader output device from pickers
+    // MARK: Experimental: hide the Faded output device from pickers
 
     var isOutputHidden: Bool {
         guard let id = outputDevice?.id,
-              let b = try? AudioObject.getCF(id, .init(FaderProtocol.Prop.hideOutput), as: CFBoolean.self)
+              let b = try? AudioObject.getCF(id, .init(FadedProtocol.Prop.hideOutput), as: CFBoolean.self)
         else { return false }
         return CFBooleanGetValue(b)
     }
 
     func setOutputHidden(_ hidden: Bool) {
         guard let id = outputDevice?.id else { return }
-        try? AudioObject.setCF(id, .init(FaderProtocol.Prop.hideOutput), (hidden ? kCFBooleanTrue : kCFBooleanFalse)!)
+        try? AudioObject.setCF(id, .init(FadedProtocol.Prop.hideOutput), (hidden ? kCFBooleanTrue : kCFBooleanFalse)!)
     }
 }

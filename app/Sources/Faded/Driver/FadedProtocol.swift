@@ -1,4 +1,4 @@
-// FaderProtocol.swift — Swift mirror of driver/FaderProtocol.h.
+// FadedProtocol.swift — Swift mirror of driver/FadedProtocol.h.
 //
 // Kept in sync by hand (Swift can't import multi-character char constants like
 // 'fcli' from C). If you change one, change both — `make check-protocol`
@@ -7,13 +7,13 @@
 import CoreAudio
 import Foundation
 
-enum FaderProtocol {
-    static let outputDeviceUID = "com.andri.fader.output"
-    static let outputDeviceName = "Fader"
-    static let tapDeviceUID = "com.andri.fader.tap"
-    static let tapDeviceName = "Fader Tap"
-    static let appBundleID = "com.andri.fader"
-    static let driverBundleID = "com.andri.fader.driver"
+enum FadedProtocol {
+    static let outputDeviceUID = "com.andri.faded.output"
+    static let outputDeviceName = "Faded"
+    static let tapDeviceUID = "com.andri.faded.tap"
+    static let tapDeviceName = "Faded Tap"
+    static let appBundleID = "com.andri.faded"
+    static let driverBundleID = "com.andri.faded.driver"
 
     static let channelCount = 2
     static let defaultSampleRate = 48000.0
@@ -21,7 +21,7 @@ enum FaderProtocol {
 
     static let protocolVersion = "1"
 
-    /// Custom property selectors on the Fader output device object.
+    /// Custom property selectors on the Faded output device object.
     enum Prop {
         static let clients = fourCC("fcli")
         static let appGains = fourCC("fapv")
@@ -37,7 +37,7 @@ enum FaderProtocol {
     }
 }
 
-/// One entry of the driver's 'fcli' list: a process attached to the Fader device.
+/// One entry of the driver's 'fcli' list: a process attached to the Faded device.
 struct DriverClient: Hashable, Sendable {
     let pid: pid_t
     let clientID: UInt32
