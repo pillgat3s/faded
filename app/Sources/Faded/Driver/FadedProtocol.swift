@@ -10,8 +10,6 @@ import Foundation
 enum FadedProtocol {
     static let outputDeviceUID = "com.andri.faded.output"
     static let outputDeviceName = "Faded"
-    static let tapDeviceUID = "com.andri.faded.tap"
-    static let tapDeviceName = "Faded Tap"
     static let appBundleID = "com.andri.faded"
     static let driverBundleID = "com.andri.faded.driver"
 
@@ -19,7 +17,7 @@ enum FadedProtocol {
     static let defaultSampleRate = 48000.0
     static let supportedSampleRates: [Double] = [44100, 48000, 88200, 96000]
 
-    static let protocolVersion = "1"
+    static let protocolVersion = "2"
 
     /// Custom property selectors on the Faded output device object.
     enum Prop {

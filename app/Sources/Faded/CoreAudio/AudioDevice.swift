@@ -119,7 +119,7 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
         all().filter { $0.hasInput && !$0.isHidden && !$0.isFadedDevice }
     }
 
-    var isFadedDevice: Bool { uid == FadedProtocol.outputDeviceUID || uid == FadedProtocol.tapDeviceUID }
+    var isFadedDevice: Bool { uid == FadedProtocol.outputDeviceUID }
 
     var isAlive: Bool {
         let alive: UInt32 = (try? AudioObject.get(id, .init(kAudioDevicePropertyDeviceIsAlive))) ?? 0

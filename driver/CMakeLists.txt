@@ -30,7 +30,7 @@ add_subdirectory(third_party/libASPL EXCLUDE_FROM_ALL)
 # ---- the driver bundle -----------------------------------------------------
 add_library(${DRIVER_NAME} MODULE
   Driver.cpp
-  FadedFIFO.hpp
+  FadedShared.h
   FadedProtocol.h
 )
 target_link_libraries(${DRIVER_NAME} PRIVATE libASPL)

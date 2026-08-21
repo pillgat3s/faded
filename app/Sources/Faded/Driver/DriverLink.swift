@@ -16,7 +16,6 @@ final class DriverLink {
 
     private(set) var status: Status = .notInstalled
     private(set) var outputDevice: AudioDevice?
-    private(set) var tapDeviceID: AudioDeviceID?
 
     private var clientListener: ListenerToken?
     private var deviceListListener: ListenerToken?
@@ -41,17 +40,15 @@ final class DriverLink {
               let out = AudioDevice(id: outID)
         else {
             outputDevice = nil
-            tapDeviceID = nil
             clientListener = nil
             status = .notInstalled
             if previous != status { onAvailabilityChanged?() }
             return
         }
         outputDevice = out
-        tapDeviceID = AudioSystem.deviceID(forUID: FadedProtocol.tapDeviceUID)
 
         let version = AudioObject.getString(outID, .init(FadedProtocol.Prop.version)) ?? "?"
-        if version != FadedProtocol.protocolVersion || tapDeviceID == nil {
+        if version != FadedProtocol.protocolVersion {
             status = .incompatible(found: version)
         } else {
             status = .ready
@@ -126,21 +123,17 @@ final class DriverLink {
     /// Returns the rate the Tap actually runs at afterwards.
     @discardableResult
     func setSampleRate(_ rate: Double) -> Double {
-        guard let out = outputDevice, let tapID = tapDeviceID, let tap = AudioDevice(id: tapID) else { return rate }
-        guard FadedProtocol.supportedSampleRates.contains(rate) else { return tap.nominalSampleRate }
-        if abs(out.nominalSampleRate - rate) < 1, abs(tap.nominalSampleRate - rate) < 1 { return rate }
+        guard let out = outputDevice else { return rate }
+        guard FadedProtocol.supportedSampleRates.contains(rate) else { return out.nominalSampleRate }
+        if abs(out.nominalSampleRate - rate) < 1 { return rate }
         try? out.setNominalSampleRate(rate)
-        try? tap.setNominalSampleRate(rate)
+        // Nominal-rate changes are asynchronous in the HAL; wait for it to land
+        // so the play-through opens at the rate the driver is actually using.
         for _ in 0 ..< 40 {
-            if abs(out.nominalSampleRate - rate) < 1, abs(tap.nominalSampleRate - rate) < 1 { return rate }
+            if abs(out.nominalSampleRate - rate) < 1 { return rate }
             usleep(25_000)
         }
-        return tap.nominalSampleRate
-    }
-
-    /// Current rate of the Tap device (what the play-through must open at).
-    var tapSampleRate: Double {
-        tapDeviceID.flatMap(AudioDevice.init(id:))?.nominalSampleRate ?? FadedProtocol.defaultSampleRate
+        return out.nominalSampleRate
     }
 
     // MARK: Experimental: hide the Faded output device from pickers

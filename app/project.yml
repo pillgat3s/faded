@@ -20,6 +20,9 @@ settings:
     DEAD_CODE_STRIPPING: YES
     GENERATE_INFOPLIST_FILE: YES
     SWIFT_TREAT_WARNINGS_AS_ERRORS: NO
+    SWIFT_OBJC_BRIDGING_HEADER: Sources/Faded/Bridging/Faded-Bridging-Header.h
+    # The shared-memory layout lives with the driver that defines it.
+    HEADER_SEARCH_PATHS: $(SRCROOT)/../driver
 targets:
   Faded:
     type: application

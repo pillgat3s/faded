@@ -27,11 +27,14 @@ extern "C" {
 #define kFadedOutputDeviceUID       "com.andri.faded.output"
 #define kFadedOutputDeviceName      "Faded"
 
-// The hidden input device Faded.app reads the mixed output back from.
-// Hidden => not listed in Sound settings / Discord / anything, but the app
-// can still resolve it by UID (kAudioHardwarePropertyTranslateUIDToDevice).
-#define kFadedTapDeviceUID          "com.andri.faded.tap"
-#define kFadedTapDeviceName         "Faded Tap"
+// PROTOCOL 2 REMOVED THE TAP DEVICE.
+//
+// v1 exposed a second, hidden *input* device that the app read the mixed output
+// back from. It worked, but macOS lights the orange microphone indicator for
+// any process holding an audio input stream and makes no distinction between a
+// hidden virtual device and a real microphone — so the indicator was lit
+// whenever Faded routed audio. The audio now travels through shared memory
+// instead (see FadedShared.h) and no input device exists at all.
 
 #define kFadedManufacturer          "andri"
 #define kFadedModelUID              "com.andri.faded"
@@ -99,7 +102,7 @@ extern "C" {
 //   Driver protocol version, e.g. "1". App refuses to drive an incompatible
 //   driver and offers reinstall.
 #define kFadedProp_Version          'fver'
-#define kFadedProtocolVersion       "1"
+#define kFadedProtocolVersion       "2"
 
 // 'fsta' — READ ONLY, CFPropertyList (CFDictionary)
 //   Diagnostics AND the master output meter (polled ~15 Hz while the menu is

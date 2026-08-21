@@ -44,15 +44,16 @@ volume control. That is what Faded is.
 ## How it works
 
 ```
-                  ┌──────── FadedDriver.driver (HAL plug-in, inside coreaudiod) ────────┐
- Spotify ─┐       │  "Faded"  (visible OUTPUT device)          "Faded Tap"  (HIDDEN in) │
- Discord ─┼─ into ▶  per-app gain ▸ mix ▸ volume/mute ▸ FIFO ───────────▶ read back     │
- Safari  ─┘       │  (has volume + mute controls ⇒ F11/F12 drive it)                    │
-                  └───────────────────────────────────────────────┬────────────────────┘
-                                                                  ▼  AUHAL in
-                                                        Faded.app  RingBuffer
-                                                                  ▼  AUHAL out
-                                          Astro A50 / speakers / AirPods / USB DAC
+                 ┌──── FadedDriver.driver (HAL plug-in, inside coreaudiod) ────┐
+ Spotify ─┐      │  "Faded"  —  the only device it publishes                   │
+ Discord ─┼─into ▶  per-app gain ▸ mix ▸ volume/mute ─────▶ shared memory ring │
+ Safari  ─┘      │  (has volume + mute controls ⇒ F11/F12 drive it)            │
+                 └────────────────────────────────────────────┬───────────────┘
+                                                              │ mmap, read-only
+                                                   Faded.app  ▼
+                                                              │ AUHAL *output* only
+                                                              ▼
+                                       Astro A50 / speakers / AirPods / USB DAC
 ```
 
 **Volume keys.** The "Faded" device declares a real volume and mute control, so
@@ -62,12 +63,25 @@ mirrors the value onto it and tells the driver to bypass its own gain — no
 double attenuation, and AirPods stem gestures still sync back. If it doesn't,
 the driver applies the gain in software. Either way the keys work.
 
-**No fake microphone.** The read-back device is marked
-`kAudioDevicePropertyIsHidden`: Faded finds it by UID and nothing else lists
-it. This is the thing that goes wrong with most virtual-device audio tools —
-they expose an input device, and then it turns up in Discord's microphone
-picker. Input is not interposed at all; Faded selects the system input device
-and drives its hardware controls directly.
+**No input stream anywhere, and no microphone indicator.** The obvious way to
+get audio back out of a virtual output device is to publish a second, hidden
+*input* device and read from it. Faded did that first, and it works — but macOS
+lights the orange microphone indicator for any process holding an audio input
+stream, and it draws no distinction between a hidden virtual device and a real
+microphone. The indicator was therefore lit for as long as Faded was routing
+audio, which is unacceptable for something that never records anything.
+
+So the audio does not travel over an audio device at all. The driver publishes
+a POSIX shared-memory ring (`driver/FadedShared.h`) and the app maps it
+read-only, pulling frames straight from it inside its output render callback.
+Single producer, single consumer, no locks; the read cursor lives in the app's
+own memory, which is why the mapping never needs write access. The app opens
+only an *output* unit, so no indicator appears — and the whole tap device, plus
+a buffer of latency, disappeared with it.
+
+Faded publishes exactly one device. Input is not interposed either: Faded
+selects the system input device and drives its hardware controls directly, so
+nothing of Faded's can ever turn up in Discord's microphone picker.
 
 **Per-app volume.** The `AudioServerPlugIn` API hands the driver each client's
 buffer *before* mixing, along with its pid and bundle id, so gain is applied
@@ -78,10 +92,8 @@ that happens to hold the device open.
 
 **Meters.** Output level comes free: the driver already has the mixed buffer.
 Input level does not exist as a property anywhere in CoreAudio, so it can only
-be obtained by opening a capture stream, which is why that meter is opt-in.
-
-**The read-back costs you the microphone indicator.** See *Privacy* below —
-it is the one genuinely unpleasant consequence of this design.
+be obtained by opening a capture stream, which is why that meter is opt-in and
+off by default — see *Privacy* below.
 
 ### AirPlay
 
@@ -116,30 +128,13 @@ unpacked from `chrome://extensions` — see [its README](extension/README.md).
 
 ## Privacy
 
-**macOS shows the orange microphone indicator while Faded is routing audio.**
-It is not recording you, but the indicator is honest about what it measures, so
-here is exactly why it appears.
-
-To get audio back out of the driver, the app opens an input stream on the
-hidden "Faded Tap" device and plays what it reads to the real output. macOS
-lights the privacy indicator for *any* process holding an audio input stream —
-it does not distinguish a virtual, hidden device from a real microphone. So the
-indicator tracks the play-through path, not a microphone.
-
-What that stream carries is the audio your apps are playing, on its way to your
-speakers. It is never written anywhere, and Faded has no network code at all.
-
-This is a property of the virtual-device design rather than a bug, and removing
-it means replacing the read-back device with a shared-memory channel from the
-driver — see [issue tracking](../../issues). Until then, if the indicator
-bothers you, turning off "Route audio through Faded" in Settings makes it go
-away, at the cost of everything Faded does.
-
-Separately:
-
-- **The input level meter is off by default and opt-in.** It is the only
-  feature that touches a *real* microphone. While on, it measures the peak and
-  discards the samples, and it is released the moment the menu closes.
+- **Faded does not open the microphone.** Routing audio uses shared memory, not
+  a capture stream, so the orange microphone indicator stays off.
+- **The input level meter is the one exception, and it is opt-in and off by
+  default.** macOS has no way to report a microphone's level without listening
+  to it, so that meter does open a capture stream while the menu is on screen —
+  and the indicator appears for exactly that long. It measures the peak and
+  discards the samples; nothing is recorded or written.
 - Bluetooth inputs are never metered: opening a capture stream on an
   AirPods-class device forces the A2DP→HFP profile switch that wrecks playback.
 - No network code, no analytics, no accounts. Settings live in
@@ -215,7 +210,7 @@ turn one on.
   lists entirely; whether macOS will accept a hidden device as the default
   output is not yet established, and Faded turns the setting back off if it
   won't.
-- Adds roughly 10–25 ms of latency.
+- Adds roughly 5–15 ms of latency.
 - Input volume only works on devices that expose a hardware input control.
 - Not suitable for bit-perfect playback chains — there is an extra hop.
 - Apple silicon only as configured; the app is universal but the driver builds

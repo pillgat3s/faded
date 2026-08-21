@@ -378,20 +378,27 @@ struct MenuView: View {
     private var footer: some View {
         VStack(spacing: 0) {
             Divider().padding(.horizontal, 12).padding(.bottom, 6)
-            Button {
+            footerRow("Sound Settings…") {
                 if let url = URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension") {
                     NSWorkspace.shared.open(url)
                 }
-            } label: {
-                HStack {
-                    Text("Sound Settings…").font(.system(size: 13))
-                    Spacer()
-                }
-                .padding(.horizontal, 8)
             }
-            .buttonStyle(MenuRowStyle())
+            footerRow("Quit Faded") {
+                NSApp.terminate(nil)
+            }
+        }
+    }
+
+    private func footerRow(_ label: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                Text(label).font(.system(size: 13))
+                Spacer()
+            }
             .padding(.horizontal, 8)
         }
+        .buttonStyle(MenuRowStyle())
+        .padding(.horizontal, 8)
     }
 
     private func sectionTitle(_ s: String) -> some View {

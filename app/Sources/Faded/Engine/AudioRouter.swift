@@ -261,7 +261,7 @@ final class AudioRouter {
     // MARK: Engage / disengage
 
     func engage() {
-        guard !isEngaged, driver.isReady, let faded = driver.outputDevice, let tapID = driver.tapDeviceID else {
+        guard !isEngaged, driver.isReady, let faded = driver.outputDevice else {
             driverStatus = driver.status
             return
         }
@@ -282,7 +282,7 @@ final class AudioRouter {
 
         target = initialTarget
         do {
-            try startEngine(for: initialTarget, tapID: tapID)
+            try startEngine(for: initialTarget)
         } catch {
             lastError = "\(error)"
             Self.log.error("engine start failed: \(String(describing: error))")
@@ -350,7 +350,6 @@ final class AudioRouter {
     }
 
     private func retarget(_ device: AudioDevice) {
-        guard let tapID = driver.tapDeviceID else { return }
         if let old = target, old.uid != device.uid {
             previousTargets.removeAll { $0 == old.uid }
             previousTargets.append(old.uid)
@@ -364,7 +363,7 @@ final class AudioRouter {
             if engine.isRunning, abs(engine.sampleRate - rate) < 1 {
                 try engine.retarget(output: device.id)
             } else {
-                try startEngine(for: device, tapID: tapID)
+                try startEngine(for: device)
             }
         } catch {
             lastError = "\(error)"
@@ -375,10 +374,10 @@ final class AudioRouter {
         Self.log.info("target → \(device.name)")
     }
 
-    private func startEngine(for device: AudioDevice, tapID: AudioDeviceID) throws {
+    private func startEngine(for device: AudioDevice) throws {
         let wanted = engineRate(for: device)
         let actual = driver.setSampleRate(wanted)
-        try engine.start(tap: tapID, output: device.id, sampleRate: actual)
+        try engine.start(output: device.id, sampleRate: actual)
     }
 
     /// Run the virtual devices at the target's rate when we can, so nothing
@@ -644,11 +643,11 @@ final class AudioRouter {
     }
 
     private func targetRateChanged() {
-        guard isEngaged, let t = target, let tapID = driver.tapDeviceID else { return }
+        guard isEngaged, let t = target else { return }
         let rate = engineRate(for: t)
         guard abs(rate - engine.sampleRate) >= 1 else { return }
         Self.log.info("target rate → \(rate), restarting engine")
-        do { try startEngine(for: t, tapID: tapID) } catch { lastError = "\(error)" }
+        do { try startEngine(for: t) } catch { lastError = "\(error)" }
     }
 
     // MARK: Per-app volume
@@ -943,7 +942,7 @@ final class AudioRouter {
         s += "engaged: \(isEngaged)  output: \(target?.name ?? "-")  input: \(selectedInput?.name ?? "-")\n"
         s += "output has hw volume: \(target?.hasHardwareVolume ?? false) (false ⇒ Faded applies it in software)\n"
         let e = engine.stats
-        s += "engine: rate=\(engine.sampleRate) ring=\(e.available) under=\(e.underruns) over=\(e.overruns) trims=\(e.trims)\n"
+        s += "engine: rate=\(engine.sampleRate) under=\(e.underruns) resync=\(e.resyncs) over=\(e.overruns) producing=\(e.producing)\n"
         for (k, v) in driver.stats().sorted(by: { $0.key < $1.key }) { s += "\(k)=\(v) " }
         if let err = lastError { s += "\nlast error: \(err)" }
         return s

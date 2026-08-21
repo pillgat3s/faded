@@ -31,6 +31,8 @@
 #include <CoreFoundation/CoreFoundation.h>
 
 #include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -38,7 +40,14 @@
 #include <string>
 #include <vector>
 
-#include "FadedFIFO.hpp"
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <syslog.h>
+#include <unistd.h>
+
+#include "FadedShared.h"
 #include "FadedProtocol.h"
 
 namespace {
@@ -112,6 +121,111 @@ std::vector<AudioValueRange> supportedRates()
 }
 
 // ---------------------------------------------------------------------------
+// Shared-memory publisher
+//
+// Created once, at plug-in construction, and never torn down — coreaudiod owns
+// the mapping for its own lifetime and the app maps it read-only whenever it
+// likes. Created with 0644 so only this (root-owned) process can write to it;
+// the app never needs write access because it keeps its read cursor privately.
+// ---------------------------------------------------------------------------
+
+class SharedRing {
+public:
+    static SharedRing& shared()
+    {
+        static SharedRing instance;
+        return instance;
+    }
+
+    bool ok() const { return ring_ != nullptr; }
+
+    void setSampleRate(UInt32 rate)
+    {
+        if (ring_) std::atomic_store_explicit(&ring_->sampleRate, rate, std::memory_order_relaxed);
+    }
+
+    void setRunning(bool running)
+    {
+        if (!ring_) return;
+        std::atomic_store_explicit(&ring_->outputRunning, running ? 1u : 0u, std::memory_order_relaxed);
+        if (running) {
+            // A fresh stream: tell the reader to resynchronise rather than try
+            // to play whatever stale frames are still sitting in the buffer.
+            std::atomic_fetch_add_explicit(&ring_->generation, 1u, std::memory_order_relaxed);
+        }
+    }
+
+    /// Real-time thread. Free-running writer: never waits, never reads the
+    /// consumer's position.
+    void write(const Float32* frames, UInt32 frameCount)
+    {
+        if (!ring_ || frameCount == 0) return;
+
+        const uint64_t w = std::atomic_load_explicit(&ring_->writeIndex, std::memory_order_relaxed);
+        const uint32_t start = static_cast<uint32_t>(w & kFadedRingMask);
+        const uint32_t first = std::min(frameCount, kFadedRingFrames - start);
+
+        std::memcpy(&ring_->samples[start * kFadedRingChannels], frames,
+            sizeof(Float32) * first * kFadedRingChannels);
+        if (frameCount > first) {
+            std::memcpy(&ring_->samples[0], frames + first * kFadedRingChannels,
+                sizeof(Float32) * (frameCount - first) * kFadedRingChannels);
+        }
+
+        // Release: everything above is visible before the reader sees the index.
+        std::atomic_store_explicit(&ring_->writeIndex, w + frameCount, std::memory_order_release);
+    }
+
+    const char* status() const { return status_; }
+
+private:
+    SharedRing()
+    {
+        // Unlink first: a stale object from a previous load may have the wrong
+        // size or ownership.
+        shm_unlink(kFadedShmName);
+
+        const int fd = shm_open(kFadedShmName, O_CREAT | O_RDWR, 0644);
+        if (fd < 0) {
+            std::snprintf(status_, sizeof(status_), "shm_open failed: %d (%s)", errno, std::strerror(errno));
+            syslog(LOG_ERR, "FadedDriver: %s", status_);
+            return;
+        }
+        if (ftruncate(fd, sizeof(FadedSharedRing)) != 0) {
+            std::snprintf(status_, sizeof(status_), "ftruncate failed: %d (%s)", errno, std::strerror(errno));
+            syslog(LOG_ERR, "FadedDriver: %s", status_);
+            close(fd);
+            return;
+        }
+        // shm_open honours umask, which would leave the app unable to read it.
+        fchmod(fd, 0644);
+
+        void* map = mmap(nullptr, sizeof(FadedSharedRing), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        close(fd);
+        if (map == MAP_FAILED) {
+            std::snprintf(status_, sizeof(status_), "mmap failed: %d (%s)", errno, std::strerror(errno));
+            syslog(LOG_ERR, "FadedDriver: %s", status_);
+            return;
+        }
+
+        ring_ = static_cast<FadedSharedRing*>(map);
+        std::memset(ring_, 0, sizeof(FadedSharedRing));
+        ring_->capacityFrames = kFadedRingFrames;
+        ring_->channels = kFadedRingChannels;
+        ring_->version = kFadedShmVersion;
+        // Magic last: the app treats it as the "fully initialised" signal.
+        std::atomic_thread_fence(std::memory_order_release);
+        ring_->magic = kFadedShmMagic;
+
+        std::snprintf(status_, sizeof(status_), "ok (%zu bytes)", sizeof(FadedSharedRing));
+        syslog(LOG_NOTICE, "FadedDriver: shared ring published at %s — %s", kFadedShmName, status_);
+    }
+
+    FadedSharedRing* ring_ = nullptr;
+    char status_[160] = "uninitialised";
+};
+
+// ---------------------------------------------------------------------------
 // Per-client state
 // ---------------------------------------------------------------------------
 
@@ -151,13 +265,16 @@ public:
 
     OSStatus OnStartIO() override
     {
-        faded::FIFO::shared().reset();
+        SharedRing::shared().setRunning(true);
         running_.store(true, std::memory_order_relaxed);
         return kAudioHardwareNoError;
     }
 
+    void publishSampleRate(UInt32 rate) { SharedRing::shared().setSampleRate(rate); }
+
     void OnStopIO() override
     {
+        SharedRing::shared().setRunning(false);
         running_.store(false, std::memory_order_relaxed);
         masterPeakL.store(0.0f, std::memory_order_relaxed);
         masterPeakR.store(0.0f, std::memory_order_relaxed);
@@ -230,7 +347,7 @@ public:
         masterPeakL.store(pl > prevL ? pl : prevL, std::memory_order_relaxed);
         masterPeakR.store(pr > prevR ? pr : prevR, std::memory_order_relaxed);
 
-        faded::FIFO::shared().write(frames, frameCount);
+        SharedRing::shared().write(frames, frameCount);
     }
 
     // -- app-facing state ---------------------------------------------
@@ -316,8 +433,6 @@ public:
         return it == handler_->gains.end() ? 1.0f : it->second;
     }
 
-    void setTapRunning(std::atomic<bool>* flag) { tapRunning_ = flag; }
-
 private:
     CFPropertyListRef copyClientList()
     {
@@ -390,28 +505,20 @@ private:
 
     CFPropertyListRef copyStats()
     {
-        auto& fifo = faded::FIFO::shared();
         CFMutableDictionaryRef d = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
             &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-        dictSet(d, "fifoFrames", makeCFNumber(static_cast<long long>(fifo.availableFrames())));
-        dictSet(d, "underruns", makeCFNumber(static_cast<long long>(fifo.underruns())));
-        dictSet(d, "overruns", makeCFNumber(static_cast<long long>(fifo.overruns())));
-        dictSet(d, "trims", makeCFNumber(static_cast<long long>(fifo.trims())));
         dictSet(d, "sampleRate", makeCFNumber(GetNominalSampleRate()));
         dictSet(d, "clients", makeCFNumber(static_cast<long long>(GetClientCount())));
         dictSet(d, "peakL", makeCFNumber(static_cast<double>(handler_->masterPeakL.load())));
         dictSet(d, "peakR", makeCFNumber(static_cast<double>(handler_->masterPeakR.load())));
+        dictSet(d, "sharedRing", makeCFString(SharedRing::shared().status()));
         CFBooleanRef out = handler_->isRunning() ? kCFBooleanTrue : kCFBooleanFalse;
         CFRetain(out);
         dictSet(d, "outputRunning", out);
-        CFBooleanRef tap = (tapRunning_ && tapRunning_->load()) ? kCFBooleanTrue : kCFBooleanFalse;
-        CFRetain(tap);
-        dictSet(d, "tapRunning", tap);
         return d;
     }
 
     std::shared_ptr<OutputHandler> handler_;
-    std::atomic<bool>* tapRunning_ = nullptr;
 };
 
 std::shared_ptr<aspl::Client> OutputHandler::OnAddClient(const aspl::ClientInfo& info)
@@ -430,33 +537,6 @@ void OutputHandler::OnRemoveClient(std::shared_ptr<aspl::Client> /*client*/)
         dev->clientsChanged();
     }
 }
-
-// ---------------------------------------------------------------------------
-// The hidden Tap input device
-// ---------------------------------------------------------------------------
-
-class TapHandler : public aspl::ControlRequestHandler, public aspl::IORequestHandler {
-public:
-    OSStatus OnStartIO() override
-    {
-        running.store(true, std::memory_order_relaxed);
-        return kAudioHardwareNoError;
-    }
-    void OnStopIO() override { running.store(false, std::memory_order_relaxed); }
-
-    void OnReadClientInput(const std::shared_ptr<aspl::Client>& /*client*/,
-        const std::shared_ptr<aspl::Stream>& /*stream*/,
-        Float64 /*zeroTimestamp*/,
-        Float64 /*timestamp*/,
-        void* bytes,
-        UInt32 bytesCount) override
-    {
-        faded::FIFO::shared().read(static_cast<float*>(bytes),
-            bytesCount / (sizeof(Float32) * kFadedChannelCount));
-    }
-
-    std::atomic<bool> running{false};
-};
 
 // ---------------------------------------------------------------------------
 // Assembly
@@ -489,6 +569,10 @@ std::shared_ptr<aspl::Driver> CreateFadedDriver()
     outParams.SafetyOffset = 64;
     outParams.ZeroTimeStampPeriod = 512;
 
+    // Touch the singleton early so the ring exists (and its status is logged)
+    // before any I/O starts.
+    SharedRing::shared().setSampleRate(kFadedDefaultSampleRate);
+
     auto outHandler = std::make_shared<OutputHandler>();
     auto outDevice = std::make_shared<FadedOutputDevice>(context, outParams, outHandler);
     outHandler->attach(outDevice);
@@ -499,43 +583,12 @@ std::shared_ptr<aspl::Driver> CreateFadedDriver()
     outDevice->AddStreamWithControlsAsync(outStream); // stream + volume + mute
     outDevice->SetAvailableSampleRatesAsync(supportedRates());
 
-    // ---- Faded Tap (input, hidden) ----
-    aspl::DeviceParameters tapParams;
-    tapParams.Name = kFadedTapDeviceName;
-    tapParams.Manufacturer = kFadedManufacturer;
-    tapParams.DeviceUID = kFadedTapDeviceUID;
-    tapParams.ModelUID = kFadedModelUID;
-    tapParams.CanBeDefault = false;
-    tapParams.CanBeDefaultForSystemSounds = false;
-    tapParams.SampleRate = kFadedDefaultSampleRate;
-    tapParams.ChannelCount = kFadedChannelCount;
-    tapParams.EnableMixing = false;
-    tapParams.SafetyOffset = 64;
-    tapParams.ZeroTimeStampPeriod = 512;
-
-    auto tapHandler = std::make_shared<TapHandler>();
-    auto tapDevice = std::make_shared<aspl::Device>(context, tapParams);
-    tapDevice->SetControlHandler(tapHandler);
-    tapDevice->SetIOHandler(tapHandler);
-
-    aspl::StreamParameters tapStream;
-    tapStream.Direction = aspl::Direction::Input;
-    tapStream.Format = floatFormat(kFadedDefaultSampleRate);
-    tapDevice->AddStreamAsync(tapStream);
-    tapDevice->SetAvailableSampleRatesAsync(supportedRates());
-#ifndef FADED_TAP_VISIBLE
-    tapDevice->SetIsHidden(true);
-#endif
-
-    outDevice->setTapRunning(&tapHandler->running);
-
     // ---- plug-in ----
     aspl::PluginParameters pluginParams;
     pluginParams.Manufacturer = kFadedManufacturer;
     pluginParams.ResourceBundlePath = "";
     auto plugin = std::make_shared<aspl::Plugin>(context, pluginParams);
     plugin->AddDevice(outDevice);
-    plugin->AddDevice(tapDevice);
 
     return std::make_shared<aspl::Driver>(context, plugin);
 }
