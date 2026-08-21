@@ -51,7 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // driver or touching the audio system. Debug builds only.
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--render-menu"), i + 1 < args.count {
-            renderMenu(to: args[i + 1], expanded: args.contains("--expanded"))
+            renderMenu(to: args[i + 1], expanded: args.contains("--expanded"), demo: args.contains("--demo"))
             NSApp.terminate(nil)
         }
         if let i = args.firstIndex(of: "--render-settings"), i + 1 < args.count {
@@ -70,8 +70,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @MainActor
-    private func renderMenu(to path: String, expanded: Bool) {
-        router.applyPreviewState()
+    private func renderMenu(to path: String, expanded: Bool, demo: Bool = false) {
+        router.applyPreviewState(demo: demo)
         let view = MenuView(router: router, previewExpandApps: expanded)
             .padding(6)
             .background(.background)

@@ -42,6 +42,9 @@ struct MenuView: View {
             router.startMetering()
         }
         .onDisappear { router.stopMetering() }
+        // NB: MenuBarExtra(.window) builds this view at launch and does not
+        // reliably send onDisappear, so the router also checks popover
+        // visibility on every tick — see AudioRouter.startMetering().
         .alert("Driver", isPresented: Binding(get: { installError != nil }, set: { if !$0 { installError = nil } })) {
             Button("OK") { installError = nil }
         } message: { Text(installError ?? "") }
@@ -163,35 +166,6 @@ struct MenuView: View {
     private var inputSection: some View {
         VStack(alignment: .leading, spacing: 1) {
             sectionTitle("Input")
-            HStack(spacing: 8) {
-                Image(systemName: "mic.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 14)
-                FadedSlider(value: Binding(get: { router.inputMuted ? 0 : router.inputVolume },
-                                           set: { router.setInputVolume($0) }),
-                            enabled: router.selectedInput?.hasInputVolume ?? false)
-                Button {
-                    router.setInputMuted(!router.inputMuted)
-                } label: {
-                    Image(systemName: router.inputMuted ? "mic.slash.fill" : "mic.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(router.inputMuted ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary))
-                        .frame(width: 16)
-                }
-                .buttonStyle(.plain)
-                .disabled(router.selectedInput?.isInputMuted == nil)
-                .help(router.inputMuted ? "Unmute microphone" : "Mute microphone")
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 4)
-
-            if let i = router.selectedInput, !i.hasInputVolume {
-                Text("\(i.name) has no input volume control.")
-                    .font(.system(size: 10.5)).foregroundStyle(.tertiary)
-                    .padding(.horizontal, 16).padding(.bottom, 2)
-            }
-
             ForEach(router.visibleInputs) { dev in
                 deviceRow(dev, selected: dev.uid == router.selectedInput?.uid, kind: .input)
             }
@@ -290,7 +264,7 @@ struct MenuView: View {
             ForEach(visibleAppRows) { app in
                 appRow(app)
             }
-            if appsExpanded, visibleAppRows.isEmpty {
+            if visibleAppRows.isEmpty {
                 Text("Nothing is playing audio.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                     .padding(.horizontal, 16).padding(.vertical, 4)

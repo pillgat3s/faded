@@ -9,9 +9,12 @@ settings:
     SWIFT_VERSION: "6.0"
     SWIFT_STRICT_CONCURRENCY: complete
     MACOSX_DEPLOYMENT_TARGET: "26.0"
-    # Same stable identity as SafeKey: an ad-hoc signature changes every build,
-    # which resets TCC grants and (for us) the "Faded" login item registration.
-    CODE_SIGN_IDENTITY: "Apple Development: thomannandri@gmail.com (R6QBGGCUGC)"
+    # Ad-hoc by default so a fresh clone builds with no setup. The Makefile
+    # overrides this with $(CODESIGN_ID) — set a real identity there (see
+    # local.mk in the README), because an ad-hoc signature changes on every
+    # build and macOS then resets the app's microphone permission and its
+    # login-item registration each time.
+    CODE_SIGN_IDENTITY: "-"
     CODE_SIGN_STYLE: Manual
     ENABLE_HARDENED_RUNTIME: NO
     DEAD_CODE_STRIPPING: YES

@@ -84,6 +84,22 @@ final class AudioRouter {
         }
     }
 
+    /// Draw a live level meter for the selected *input* device.
+    ///
+    /// Off by default, and deliberately separate from `showMeters`: output
+    /// metering is free (the driver already has the mixed buffer), but there is
+    /// no property anywhere in CoreAudio that reports an input's level, so this
+    /// one has to open a capture stream — which lights the orange microphone
+    /// indicator in the menu bar for as long as it runs. Faded does not do that
+    /// unless you ask for it.
+    var showInputMeter: Bool {
+        didSet {
+            guard oldValue != showInputMeter else { return }
+            defaults.set(showInputMeter, forKey: Keys.showInputMeter)
+            if !showInputMeter { inputMeter.stop(); inputLevel = (0, 0) }
+        }
+    }
+
     /// Show the Input section in the menu.
     var showInputSection: Bool {
         didSet {
@@ -113,7 +129,7 @@ final class AudioRouter {
     /// True when the selected input's level can be shown (Bluetooth excluded —
     /// capturing would force the HFP profile and wreck playback).
     var canMeterInput: Bool {
-        guard showMeters, let i = selectedInput else { return false }
+        guard showMeters, showInputMeter, let i = selectedInput else { return false }
         return InputMeter.canMeter(i)
     }
 
@@ -158,6 +174,7 @@ final class AudioRouter {
     private var targetRateListener: ListenerToken?
     private var inputControlListeners: [ListenerToken] = []
     private var meterTimer: Timer?
+    private var idleTicks = 0
 
     private var previewMode = false      // DEBUG --render-menu only
     private var settingDefault = false   // re-entrancy guard for default-device writes
@@ -171,6 +188,16 @@ final class AudioRouter {
     private var appKeys: [String: [String]]      // app id → driver client keys last seen
     private var previousTargets: [String] = []   // UIDs, most recent last
 
+    /// App id → when it last produced a signal above `audibleThreshold`.
+    /// Every process that merely *opens* the device is a driver client —
+    /// corespeechd, callservicesd, loginwindow, Siri and a dozen other daemons
+    /// sit there permanently at digital silence. Only things actually making
+    /// sound belong in the menu, so an app has to have been audible recently to
+    /// be listed (starred apps are exempt).
+    private var lastAudible: [String: Date] = [:]
+    private let audibleThreshold: Float = 0.0003   // ≈ −70 dBFS
+    private let audibleHold: TimeInterval = 8      // keep listed this long after it goes quiet
+
     private enum Keys {
         static let enabled = "enabled"
         static let volumeByDevice = "volumeByDevice"
@@ -183,6 +210,7 @@ final class AudioRouter {
         static let previousTargets = "previousTargets"
         static let hideFaded = "hideFadedDevice"
         static let showMeters = "showMeters"
+        static let showInputMeter = "showInputMeter"
         static let showInputSection = "showInputSection"
         static let hiddenOutputs = "hiddenOutputUIDs"
         static let hiddenInputs = "hiddenInputUIDs"
@@ -193,6 +221,7 @@ final class AudioRouter {
         enabled = defaults.object(forKey: Keys.enabled) as? Bool ?? true
         hideFadedDevice = defaults.bool(forKey: Keys.hideFaded)
         showMeters = defaults.object(forKey: Keys.showMeters) as? Bool ?? true
+        showInputMeter = defaults.bool(forKey: Keys.showInputMeter)   // opt-in: uses the mic
         showInputSection = defaults.object(forKey: Keys.showInputSection) as? Bool ?? true
         volumeByDevice = defaults.dictionary(forKey: Keys.volumeByDevice) as? [String: Float] ?? [:]
         mutedByDevice = defaults.dictionary(forKey: Keys.mutedByDevice) as? [String: Bool] ?? [:]
@@ -217,6 +246,11 @@ final class AudioRouter {
         }
         defaultInputListener = AudioObject.listen(AudioSystem.object, .init(kAudioHardwarePropertyDefaultInputDevice)) { [weak self] in
             Task { @MainActor in self?.refreshInputs() }
+        }
+
+        NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.stopMetering() }
         }
 
         refreshDevices()
@@ -371,7 +405,7 @@ final class AudioRouter {
         selectedInput = device
         installInputListeners()
         readInputLevels()
-        if meterTimer != nil, showMeters { inputMeter.start(device: device) }
+
     }
 
     func setInputVolume(_ v: Float) {
@@ -494,7 +528,7 @@ final class AudioRouter {
             selectedInput = current
             installInputListeners()
             readInputLevels()
-            if meterTimer != nil, showMeters, let c = current { inputMeter.start(device: c) }
+
         }
     }
 
@@ -642,8 +676,22 @@ final class AudioRouter {
             }
         }
 
-        // Starred apps stay in the list even when they're not playing, so their
-        // level is adjustable before they make a sound.
+        // Anything that has actually made a sound recently stays listed for a
+        // few seconds, so a quiet passage or a pause doesn't make the row
+        // disappear under the cursor.
+        let now = Date()
+        for (id, e) in byApp where e.peak > audibleThreshold { lastAudible[id] = now }
+        func audible(_ id: String) -> Bool {
+            guard let t = lastAudible[id] else { return false }
+            return now.timeIntervalSince(t) < audibleHold
+        }
+        byApp = byApp.filter { audible($0.key) || starredApps.contains($0.key) }
+        for (id, e) in byApp where !audible(id) {
+            var e = e; e.isPlaying = false; byApp[id] = e
+        }
+
+        // Starred apps stay in the list even when they're silent or not running,
+        // so their level can be set before they make a sound.
         for id in starredApps where byApp[id] == nil {
             let name = appNames[id] ?? ProcessResolver.staticInfo(bundleID: id)?.name ?? id
             byApp[id] = AppEntry(id: id, name: name, pid: 0,
@@ -655,13 +703,10 @@ final class AudioRouter {
 
         // Remember each app's driver keys so a stored gain can be pushed before
         // the app next opens the device.
-        for (id, e) in byApp where e.isPlaying && !e.keys.isEmpty {
-            appKeys[id] = Array(e.keys)
-        }
+        for (id, e) in byApp where !e.keys.isEmpty { appKeys[id] = Array(e.keys) }
         defaults.set(appNames, forKey: Keys.appNames)
         defaults.set(appKeys, forKey: Keys.appKeys)
 
-        // Starred first (alphabetical), then everything else that's playing.
         let starred = byApp.values.filter(\.starred).sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         let rest = playingOrder.compactMap { byApp[$0] }.filter { !$0.starred }
         apps = starred + rest
@@ -764,11 +809,17 @@ final class AudioRouter {
 
     // MARK: Meters — only while the menu is open
 
+    /// Start the meter loop.
+    ///
+    /// `MenuBarExtra(.window)` builds its content view at launch and does not
+    /// reliably send `onDisappear` when the popover closes, so visibility is
+    /// checked on every tick instead: the popover is a non-`.normal` level
+    /// window, the Settings window is `.normal`. Anything mic-related is gated
+    /// on that check, and the loop shuts itself down once the popover has been
+    /// gone for a few seconds.
     func startMetering() {
-        if previewMode { return }
-        stopMetering()
-        guard showMeters else { return }
-        if let i = selectedInput { inputMeter.start(device: i) }
+        if previewMode || meterTimer != nil { return }
+        idleTicks = 0
         meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 15.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tickMeters() }
         }
@@ -783,36 +834,74 @@ final class AudioRouter {
         inputLevel = (0, 0)
     }
 
+    /// True while the menu bar popover is on screen. The Settings window sits
+    /// at `.normal` level, so it does not count — no reason to hold the
+    /// microphone open while someone is reading a preferences pane.
+    private var menuPopoverIsVisible: Bool {
+        NSApp.windows.contains { $0.isVisible && $0.level != .normal }
+    }
+
     private func tickMeters() {
         if previewMode { return }
-        inputLevel = inputMeter.isRunning ? inputMeter.level : (0, 0)
-        guard isEngaged else { outputLevel = (0, 0); return }
 
+        guard menuPopoverIsVisible else {
+            // Popover closed (or never opened). Release the microphone at once
+            // and wind the whole loop down shortly after.
+            inputMeter.stop()
+            inputLevel = (0, 0)
+            outputLevel = (0, 0)
+            idleTicks += 1
+            if idleTicks > 45 { stopMetering() }   // ~3 s
+            return
+        }
+        idleTicks = 0
+
+        if showMeters, showInputMeter, let i = selectedInput, InputMeter.canMeter(i) {
+            inputMeter.start(device: i)
+            inputLevel = inputMeter.level
+        } else {
+            inputMeter.stop()
+            inputLevel = (0, 0)
+        }
+
+        guard isEngaged else { outputLevel = (0, 0); return }
         let stats = driver.stats()
         outputLevel = (Float(stats["peakL"] as? Double ?? 0), Float(stats["peakR"] as? Double ?? 0))
 
+        let clients = driver.clients()
         var peakByKey: [String: Float] = [:]
-        for c in driver.clients() { peakByKey[c.key] = max(peakByKey[c.key] ?? 0, c.peak) }
+        for c in clients { peakByKey[c.key] = max(peakByKey[c.key] ?? 0, c.peak) }
         for i in apps.indices {
-            apps[i].peak = apps[i].isPlaying ? apps[i].keys.reduce(0) { max($0, peakByKey[$1] ?? 0) } : 0
+            apps[i].peak = apps[i].keys.reduce(0) { max($0, peakByKey[$1] ?? 0) }
         }
+
+        // Did anything start or stop being audible? Only then rebuild the list.
+        let now = Date()
+        let before = Set(apps.map(\.id))
+        var changed = false
+        for c in clients where c.peak > audibleThreshold {
+            let id = ProcessResolver.resolve(pid: c.pid, bundleID: c.bundleID).id
+            if lastAudible[id] == nil || !before.contains(id) { changed = true }
+            lastAudible[id] = now
+        }
+        if !changed {
+            changed = apps.contains { !$0.starred && (lastAudible[$0.id].map { now.timeIntervalSince($0) >= audibleHold } ?? true) }
+        }
+        if changed { refreshApps() }
     }
 
 #if DEBUG
     /// Fills in the parts of the menu that need a working driver so the layout
-    /// can be rendered and eyeballed without installing anything. Real devices
-    /// are kept — only the driver status, meters and app list are faked.
+    /// can be rendered and reviewed without installing anything.
+    /// `demo: true` also swaps in invented devices, so the README screenshot
+    /// doesn't leak the device names of whatever machine generated it.
     /// Used by `--render-menu`; never reachable in a Release build.
-    func applyPreviewState() {
+    func applyPreviewState(demo: Bool = false) {
         previewMode = true
         driverStatus = .ready
         isEngaged = true
-        if target == nil { target = allOutputs.first }
-        if selectedInput == nil { selectedInput = allInputs.first }
         volume = 0.55
         outputLevel = (0.42, 0.51)
-        inputLevel = (0.18, 0.18)
-        inputVolume = 0.8
         apps = [
             AppEntry(id: "com.spotify.client", name: "Spotify", pid: 0, gain: 0.65, muted: false,
                      peak: 0.5, keys: [], isBare: false, starred: true, isPlaying: true),
@@ -821,6 +910,29 @@ final class AudioRouter {
             AppEntry(id: "com.apple.Safari", name: "Safari", pid: 0, gain: 0.4, muted: true,
                      peak: 0, keys: [], isBare: false, starred: false, isPlaying: true),
         ]
+        if demo {
+            allOutputs = [
+                AudioDevice(demoID: 1, uid: "d1", name: "MacBook Pro Speakers", transport: .builtIn,
+                            hasOutput: true, hasInput: false, hasHardwareVolume: true, hasInputVolume: false),
+                AudioDevice(demoID: 2, uid: "d2", name: "Astro A50 Game", transport: .usb,
+                            hasOutput: true, hasInput: true, hasHardwareVolume: false, hasInputVolume: false),
+                AudioDevice(demoID: 3, uid: "d3", name: "AirPods Pro", transport: .bluetooth,
+                            hasOutput: true, hasInput: true, hasHardwareVolume: true, hasInputVolume: false),
+                AudioDevice(demoID: 4, uid: "d4", name: "Studio Display", transport: .displayPort,
+                            hasOutput: true, hasInput: false, hasHardwareVolume: false, hasInputVolume: false),
+            ]
+            allInputs = [
+                AudioDevice(demoID: 5, uid: "d5", name: "MacBook Pro Microphone", transport: .builtIn,
+                            hasOutput: false, hasInput: true, hasHardwareVolume: false, hasInputVolume: true),
+                AudioDevice(demoID: 6, uid: "d6", name: "Astro A50 Voice", transport: .usb,
+                            hasOutput: false, hasInput: true, hasHardwareVolume: false, hasInputVolume: false),
+            ]
+            target = allOutputs[1]        // the Astro — software volume, the reason this exists
+            selectedInput = allInputs[0]
+            return
+        }
+        if target == nil { target = allOutputs.first }
+        if selectedInput == nil { selectedInput = allInputs.first }
     }
 #endif
 

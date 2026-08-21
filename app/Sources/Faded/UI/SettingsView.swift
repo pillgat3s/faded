@@ -70,6 +70,10 @@ private struct GeneralSettings: View {
             Section {
                 Toggle("Show level meters", isOn: $router.showMeters)
                 Toggle("Show input devices in the menu", isOn: $router.showInputSection)
+                Toggle("Meter the input device too", isOn: $router.showInputMeter)
+                    .disabled(!router.showMeters)
+                Text("Off by default. macOS has no way to report a microphone's level without listening to it, so this opens a capture stream and the orange microphone indicator appears while the menu is open. Faded measures the level and discards the audio — nothing is recorded — but if you would rather it never touched the microphone, leave this off.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("Hide “Faded” from macOS device lists", isOn: $router.hideFadedDevice)
                 Text("Experimental. If macOS refuses to use a hidden device as the default output, Faded turns this back off by itself.")
                     .font(.caption).foregroundStyle(.secondary)

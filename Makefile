@@ -16,9 +16,18 @@ DRIVER_DIR := $(ROOT)/driver
 APP_DIR    := $(ROOT)/app
 OUT        := $(ROOT)/build
 CONFIG     ?= Release
-# Same identity the app uses (see app/project.yml). Override with
-# CODESIGN_ID=- for ad-hoc.
-CODESIGN_ID ?= Apple Development: thomannandri@gmail.com (R6QBGGCUGC)
+# Code signing identity for both the driver and the app.
+#
+# Defaults to ad-hoc ("-"), which builds and runs fine. For day-to-day use set
+# a real identity instead — an ad-hoc signature changes on every build, so
+# macOS treats each rebuild as a different app and resets its microphone
+# permission and its login-item registration. Either export it:
+#
+#     make CODESIGN_ID="Apple Development: you@example.com (TEAMID)"
+#
+# or drop that line into an untracked local.mk, which is included below.
+-include $(ROOT)/local.mk
+CODESIGN_ID ?= -
 
 .PHONY: all driver app install install-driver uninstall-driver uninstall check-protocol clean
 
@@ -32,7 +41,7 @@ driver:
 app: driver check-protocol
 	cd $(APP_DIR) && xcodegen generate
 	cd $(APP_DIR) && xcodebuild -project Faded.xcodeproj -scheme Faded -configuration $(CONFIG) \
-	    -derivedDataPath build build | grep -E "error|warning: .*Sources/Faded|BUILD" || true
+	    -derivedDataPath build CODE_SIGN_IDENTITY="$(CODESIGN_ID)" build | grep -E "error|warning: .*Sources/Faded|BUILD" || true
 	@mkdir -p $(OUT)
 	@rm -rf $(OUT)/Faded.app
 	@cp -R $(APP_DIR)/build/Build/Products/$(CONFIG)/Faded.app $(OUT)/

@@ -85,6 +85,26 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
         isHidden = hidden != 0
     }
 
+#if DEBUG
+    /// Synthesises a device that isn't attached to any real hardware, so the
+    /// README screenshot can be generated without leaking the machine's actual
+    /// device names. Debug builds only.
+    init(demoID: AudioDeviceID, uid: String, name: String, transport: Transport,
+         hasOutput: Bool, hasInput: Bool, hasHardwareVolume: Bool, hasInputVolume: Bool)
+    {
+        id = demoID
+        self.uid = uid
+        self.name = name
+        self.transport = transport
+        self.hasOutput = hasOutput
+        self.hasInput = hasInput
+        self.hasHardwareVolume = hasHardwareVolume
+        hasHardwareMute = hasHardwareVolume
+        self.hasInputVolume = hasInputVolume
+        isHidden = false
+    }
+#endif
+
     static func all() -> [AudioDevice] {
         AudioSystem.allDeviceIDs().compactMap(AudioDevice.init(id:))
     }

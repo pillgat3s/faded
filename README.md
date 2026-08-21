@@ -1,209 +1,190 @@
 # Faded
 
-A personal macOS menu bar sound control, shaped like the stock Control Center
-Sound module but with the parts SoundSource has and macOS doesn't:
+A macOS menu bar sound control shaped like the stock Control Center Sound
+module, with the parts macOS is missing.
 
-- **Volume keys work on every output device** — including ones with no volume
-  control of their own (Astro A50 base station, HDMI/DisplayPort, most USB DACs).
-- **Per-app volume and mute**, with a **star** to pin the apps you always want
-  to see. Everything else stays behind a dropdown.
-- **Output *and* input devices in one panel**, with input volume/mute.
-- **Level meters** to the left of each device and app, the way SoundSource
-  shows them.
-- **Hide devices** you never use; they collapse behind "Show More".
-- Clean Settings window, launch at login.
+<p align="center">
+  <img src="docs/menu.png" width="352" alt="Faded's menu: Sound title, output slider, Output and Input device lists with level meters, and an Apps section with per-app sliders">
+</p>
 
-Deliberately **not** included: boost above 100 %, sample-rate switching,
-balance, an equalizer, per-app device redirection.
+- **The volume keys work on every output device** — including the ones that
+  have no volume control of their own, where macOS greys the slider out and
+  F11/F12 do nothing. USB headset base stations (Astro A50 and friends),
+  HDMI/DisplayPort audio, plenty of USB DACs.
+- **Per-app volume and mute**, with a ⭐ to pin the apps you always want in
+  reach. Everything else appears only while it is actually making sound.
+- **Output and input devices in one panel**, the way Control Center does it.
+- **Level meters** beside each device and app.
+- **Hide devices** you never use — they collapse behind "Show More".
+- Small Settings window, launch at login.
 
-**Status: built and compiling clean. Not yet run against real audio hardware —
-the checklist at the bottom is the first live test.**
+Deliberately **not** included: volume boost above 100 %, sample-rate switching,
+balance, an equalizer, per-app device redirection. If you want those, buy
+[SoundSource](https://rogueamoeba.com/soundsource/) — it is excellent and does
+far more than this.
+
+> **Status:** young. It runs on the author's machine and does what the list
+> above says, but it has not been through a wide range of hardware, and the
+> build is signed for local use rather than distribution. Treat it as
+> something to read and build yourself, not as a product.
 
 ---
 
-## How it works
+## Why
 
-macOS has two ways to sit between apps and a speaker: Rogue Amoeba's
-proprietary ARK engine, or a virtual audio device. Faded is a virtual device,
-designed around the failure modes of the usual ones (fake microphones showing
-up in Discord, device switching breaking when AirPods connect).
+macOS decides whether the volume keys work by asking the *output device* to
+change its own volume. Devices like the Astro A50 base station don't implement
+a volume control at all — they expect you to use the wheel on the headset — so
+macOS greys out the slider and the keyboard keys do nothing. There is no
+setting that fixes this, because there is nothing to set.
+
+The only way around it is to put something in the audio path that *does* have a
+volume control. That is what Faded is.
+
+## How it works
 
 ```
                   ┌──────── FadedDriver.driver (HAL plug-in, inside coreaudiod) ────────┐
  Spotify ─┐       │  "Faded"  (visible OUTPUT device)          "Faded Tap"  (HIDDEN in) │
  Discord ─┼─ into ▶  per-app gain ▸ mix ▸ volume/mute ▸ FIFO ───────────▶ read back     │
- Safari  ─┘       │  (has volume+mute controls ⇒ F11/F12 drive it)                      │
+ Safari  ─┘       │  (has volume + mute controls ⇒ F11/F12 drive it)                    │
                   └───────────────────────────────────────────────┬────────────────────┘
                                                                   ▼  AUHAL in
-                                                       Faded.app  RingBuffer
+                                                        Faded.app  RingBuffer
                                                                   ▼  AUHAL out
                                           Astro A50 / speakers / AirPods / USB DAC
 ```
 
-**Volume keys.** The "Faded" device declares a real volume + mute control, so
-macOS drives it from the keyboard and the Sound slider like any other device.
-If the *real* target has hardware volume, Faded mirrors the value onto it and
-tells the driver to bypass its own gain (no double attenuation — and AirPods
-stem gestures still sync back). If it doesn't, the driver applies the gain in
-software. Either way F11/F12 work.
+**Volume keys.** The "Faded" device declares a real volume and mute control, so
+macOS drives it from the keyboard, from Control Center and from Sound settings
+like any other device. If the *real* target device has hardware volume, Faded
+mirrors the value onto it and tells the driver to bypass its own gain — no
+double attenuation, and AirPods stem gestures still sync back. If it doesn't,
+the driver applies the gain in software. Either way the keys work.
 
-**No fake microphone.** The readback device is `kAudioDevicePropertyIsHidden`;
-Faded resolves it by UID and nothing else lists it. Input is not interposed at
-all — Faded just selects the system input device and drives its hardware
-volume/mute directly, so no app ever sees anything unusual in its mic list.
+**No fake microphone.** The read-back device is marked
+`kAudioDevicePropertyIsHidden`: Faded finds it by UID and nothing else lists
+it. This is the thing that goes wrong with most virtual-device audio tools —
+they expose an input device, and then it turns up in Discord's microphone
+picker. Input is not interposed at all; Faded selects the system input device
+and drives its hardware controls directly.
 
-**Per-app volume.** The AudioServerPlugIn API hands the driver each client's
-buffer *before* mixing, with its pid and bundle id. Gain is applied there.
-Helper processes (Chrome Helper, WebKit GPU, Discord Helper) are resolved back
-to their owning app for the UI.
+**Per-app volume.** The `AudioServerPlugIn` API hands the driver each client's
+buffer *before* mixing, along with its pid and bundle id, so gain is applied
+there. Helper processes (Chrome Helper, WebKit GPU, Discord Helper) are
+resolved back to their owning app for display. Only apps that have recently
+produced a signal are listed — otherwise you get every daemon on the system
+that happens to hold the device open.
 
-**Meters.** Output level comes free from the driver (it already has the mixed
-buffer). Input level has no equivalent property anywhere in CoreAudio, so it
-requires opening a capture unit — Faded does that only while the menu is open,
-measures the peak and discards the samples immediately. Bluetooth inputs are
-deliberately skipped: capturing from them forces the A2DP→HFP profile switch
-that wrecks playback quality.
+**Meters.** Output level comes free: the driver already has the mixed buffer.
+Input level does not exist as a property anywhere in CoreAudio, so it can only
+be obtained by opening a capture stream — see *Privacy* below.
 
-### AirPlay — read this
+### AirPlay
 
-**AirPlay speakers are not CoreAudio devices.** Verified on this machine: with
-a Sonos and an Apple TV visible in the stock Sound menu, neither appears in the
-HAL device list. macOS routes AirPlay above the HAL, through a private path.
+**AirPlay speakers are not CoreAudio devices.** A Sonos or an Apple TV shows up
+in the stock Sound menu but never appears in the HAL device list; macOS routes
+AirPlay above the HAL through a private path. Faded therefore cannot list them
+or play to them.
 
-So Faded cannot list them, and cannot play to them. What it does instead is
-**step aside**: when the system default output moves to something Faded can't
-adopt, it disengages rather than fighting for the default (which would yank you
-straight back off your AirPlay speaker). The menu says "macOS is routing audio
-directly. Faded is standing by." When an adoptable device becomes the default
-again, Faded re-engages by itself.
+What it does instead is **step aside**. When the system default output moves to
+something Faded can't adopt, it disengages rather than fighting to take the
+default back — which would otherwise yank you straight off your AirPlay
+speaker. The menu says so, and Faded re-engages by itself once a normal device
+is selected again. Pick AirPlay in Control Center exactly as you do now; you
+just lose per-app volume for as long as you're on it, because nothing of
+Faded's is in the path.
 
-Practical result: pick AirPlay in Control Center exactly like you do now, and
-it behaves exactly like it does now — Faded gets out of the way. You lose
-per-app volume for that period, because nothing of ours is in the path.
+## Privacy
 
-*(Open question for the live test: it is possible macOS materialises a
-transient CoreAudio device with transport type `airplay` while an AirPlay
-target is active — the constant exists. If it does, Faded will simply adopt it
-like any other device and everything keeps working. Step 8 of the checklist
-settles it.)*
-
-### Components
-
-| Path | What |
-|---|---|
-| `driver/` | C++17 HAL plug-in on [libASPL](https://github.com/gavv/libASPL) (MIT, vendored). `Driver.cpp` = Faded logic, `FadedFIFO.hpp` = lock-free SPSC ring, `FadedProtocol.h` = app↔driver contract |
-| `app/Sources/Faded/CoreAudio` | typed wrappers over the HAL C API, output + input |
-| `app/Sources/Faded/Driver` | driver discovery, custom-property protocol, installer (admin prompt) |
-| `app/Sources/Faded/Engine` | `PlayThrough` (two AUHAL units + ring), `InputMeter`, `AudioRouter` (the brain), `ProcessResolver` (pid → app) |
-| `app/Sources/Faded/UI` | `Controls` (slider, meter, badge), `MenuView`, `SettingsView` |
-| `scripts/` | icon generator, driver install/uninstall, protocol consistency check |
-
-App ↔ driver protocol = custom properties on the Faded device: `'fcli'` clients
-+ per-app peaks, `'fapv'` per-app gains, `'fbyp'` master bypass, `'fhid'` hide
-device, `'fsta'` stats + master meter, `'fver'` version.
-
----
+- **The microphone is off by default.** The input level meter is the only
+  feature that touches it, it is opt-in in Settings, and while it runs it
+  measures the peak and discards the samples — nothing is recorded, buffered or
+  written. macOS shows the orange indicator for as long as any capture stream
+  is open, so Faded releases it the moment the menu closes.
+- Bluetooth inputs are never metered: opening a capture stream on an
+  AirPods-class device forces the A2DP→HFP profile switch that wrecks playback.
+- No network code, no analytics, no accounts. Settings live in
+  `~/Library/Preferences/com.andri.faded.plist`.
 
 ## Build
 
-Requirements: Xcode 26, `brew install cmake xcodegen`.
+Requires Xcode 26, and `brew install cmake xcodegen`.
 
 ```bash
 make            # driver + app → build/Faded.app
-make driver     # just the .driver
+make driver     # just the HAL plug-in
 make app        # just the app (embeds the driver)
 make clean
 ```
 
+Builds are ad-hoc signed by default, which works fine. For daily use set a real
+signing identity — an ad-hoc signature changes on every build, so macOS treats
+each rebuild as a different app and resets its microphone permission and
+login-item registration:
+
+```bash
+echo 'CODESIGN_ID = Apple Development: you@example.com (TEAMID)' > local.mk
+```
+
+`local.mk` is untracked.
+
 ### Looking at the UI without installing anything
 
-Debug builds can rasterise the menu to a PNG — no driver, no audio touched:
+Debug builds can rasterise the menu to a PNG. No driver, no audio touched:
 
 ```bash
-./app/build/Build/Products/Debug/Faded.app/Contents/MacOS/Faded --render-menu /tmp/menu.png --expanded
+./app/build/Build/Products/Debug/Faded.app/Contents/MacOS/Faded \
+    --render-menu /tmp/menu.png --expanded --demo
 ```
 
-(The Settings window can't be rendered this way — `TabView` and grouped `Form`
-are AppKit-backed and come out blank. Open it for real instead.)
+(`--demo` substitutes invented device names, which is how the screenshot above
+is generated. The Settings window can't be rendered this way — `TabView` and
+grouped `Form` are AppKit-backed and come out blank.)
 
-## Install / first run
+## Install
 
 ```bash
-make install    # copies build/Faded.app → /Applications and opens it
+make install    # copies build/Faded.app to /Applications and opens it
 ```
 
-Menu bar speaker → **Install Driver…** → admin password → coreaudiod restarts
-(~1 s of silence) → Faded engages on whatever device you were already using.
-
-Manual driver install without the app: `make install-driver` (sudo).
+Then click the menu bar icon → **Install Driver…**. That asks for your password
+once and restarts `coreaudiod` (about a second of silence). Until you do, Faded
+is completely passive — the driver ships inside the app bundle but isn't
+installed, and nothing is in your audio path.
 
 ## Uninstall
 
-`make uninstall` — quits the app, removes `/Applications/Faded.app`, the driver
-in `/Library/Audio/Plug-Ins/HAL/`, prefs, and restarts coreaudiod. Or in-app:
-Settings → General → Uninstall.
+```bash
+make uninstall
+```
 
----
+Removes the app, the driver from `/Library/Audio/Plug-Ins/HAL/`, the
+preferences, and restarts `coreaudiod`. Or from inside the app: Settings →
+General → Uninstall. No launch agents, no daemons, no login items unless you
+turn one on.
 
 ## Known limitations
 
-- **If Faded.app isn't running while the driver is installed and "Faded" is the
-  default output, audio is silent** (nothing drains the FIFO). Faded restores
-  the real device on quit; it can't on a crash. Next launch fixes it. Turn on
-  Launch at Login once it's proven.
-- Control Center shows **"Faded"** as the selected output while engaged.
-  Picking a real device there works (Faded follows) — it just won't *show* as
-  selected. The experimental "Hide Faded from device lists" toggle tries to
-  make it invisible; whether macOS accepts a hidden default output is test #7.
-- Adds ~10–25 ms of latency. Tune `kPrimeFrames` (driver) / `primeFrames`
-  (app) if it ever matters.
+- **If Faded isn't running while the driver is installed and "Faded" is the
+  default output, there is no sound** — nothing drains the buffer. It restores
+  the real device when you quit, but it can't if it crashes; relaunching fixes
+  it.
+- **Stereo only.** Multichannel content is not passed through.
+- Control Center shows "Faded" as the selected output while it's engaged.
+  Picking a real device there works — Faded follows — it just won't *show* as
+  selected. There's an experimental setting to hide Faded from macOS's device
+  lists entirely; whether macOS will accept a hidden device as the default
+  output is not yet established, and Faded turns the setting back off if it
+  won't.
+- Adds roughly 10–25 ms of latency.
 - Input volume only works on devices that expose a hardware input control.
-  The Astro A50 Voice probably doesn't; the menu says so rather than pretending.
-- Personal tool: unsandboxed, Apple Development signature, arm64 only.
+- Not suitable for bit-perfect playback chains — there is an extra hop.
+- Apple silicon only as configured; the app is universal but the driver builds
+  arm64.
 
----
+## License
 
-## First live test
-
-Nothing below has been run yet. Tick as you go.
-
-1. `make install` → menu bar icon appears (speaker with ⚠ = driver missing).
-2. Click → **Install Driver…** → password → within ~10 s the popover shows the
-   Output list. `system_profiler SPAudioDataType | grep Faded` shows "Faded"
-   only (the Tap stays hidden).
-3. Play music → sound continues on the current device. Settings → General →
-   Diagnostics: `underruns` flat, `fifoFrames` ~1000–2000.
-4. **Astro A50** — select it under Output. Press F11/F12 → volume changes. 🎯
-   The Sound slider in Control Center moves it too.
-5. **Built-in speakers** — select → F11/F12 → Sound settings shows the same
-   level (mirroring), and 50 % sounds like macOS's 50 % (no double attenuation).
-6. **AirPods** — connect / pick in Control Center → Faded's header follows
-   within a second. Stem volume gestures move Faded's slider.
-7. **Hidden experiment** — Settings → "Hide Faded from device lists". If audio
-   keeps working and Control Center no longer lists Faded → jackpot. If the
-   toggle flips itself back off → macOS refused; leave it off.
-8. **AirPlay** — pick the Sonos in Control Center. Expected: the menu shows
-   "macOS is routing audio directly. Faded is standing by," and audio plays on
-   the Sonos normally. Then pick a local device again → Faded re-engages.
-   *If instead a device with an AirPlay icon appears in Faded's Output list and
-   audio flows through it, even better — tell me and I'll drop the standby path.*
-9. **Meters** — play something: the bar left of the selected output device
-   moves. Speak: the bar left of the selected input moves (not for Bluetooth
-   inputs, by design).
-10. **Input** — select MacBook Pro Microphone → the mic slider moves it (check
-    in System Settings → Sound → Input). Select Astro A50 Voice → if it has no
-    hardware control, the slider greys out and the menu says so.
-11. **Per-app** — open Spotify + a YouTube tab → expand **Apps** → both listed
-    with moving meters. Drag Spotify to 30 % → only Spotify quieter. Mute
-    YouTube → only YouTube silent. Star Spotify → collapse Apps → Spotify still
-    visible, YouTube gone. Quit Spotify → still listed (starred), greyed.
-12. **Hiding** — Settings → Devices → untick U32R59x → it disappears from the
-    menu and "Show More" appears. Click it → hidden devices show, dimmed.
-13. **Discord** — Voice settings → Faded must NOT appear in the input list.
-14. Quit Faded → default output returns to the real device, audio continues.
-15. Relaunch → re-engages without touching volume.
-
-If (2) fails: `log show --last 5m --predicate 'process == "coreaudiod"' | grep -i -E "faded|aspl"`,
-and rebuild the driver with `-DFADED_DEBUG_TRACE=ON` for verbose syslog.
-If (3) has audio but crackles: raise `kPrimeFrames` (driver) and `primeFrames`
-(app) to 2048 and rebuild.
+MIT — see [LICENSE](LICENSE). Third-party code is listed in
+[THIRD-PARTY.md](THIRD-PARTY.md); the driver is built on
+[libASPL](https://github.com/gavv/libASPL) by Victor Gaydov, also MIT.
