@@ -50,13 +50,9 @@ extern "C" {
 
 #define kFadedChannelCount          2
 #define kFadedDefaultSampleRate     48000
-// Sample rates the Faded device advertises. The app switches the device to
-// whatever the *target* (real) output runs at, so the play-through path never
-// resamples.
-#define kFadedSampleRate44k         44100
-#define kFadedSampleRate48k         48000
-#define kFadedSampleRate88k         88200
-#define kFadedSampleRate96k         96000
+// The Faded device advertises exactly one sample rate. See supportedRates() in
+// Driver.cpp: a re-ratable device ends up advertising one rate while producing
+// another, which the shared ring cannot detect, and the audio glitches.
 
 // ---------------------------------------------------------------------------
 // Custom properties on the Faded output device object

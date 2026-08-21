@@ -15,7 +15,9 @@ enum FadedProtocol {
 
     static let channelCount = 2
     static let defaultSampleRate = 48000.0
-    static let supportedSampleRates: [Double] = [44100, 48000, 88200, 96000]
+    /// One rate, matching the driver — see supportedRates() in Driver.cpp for
+    /// why the device is deliberately not re-ratable.
+    static let supportedSampleRates: [Double] = [48000]
 
     static let protocolVersion = "3"
 

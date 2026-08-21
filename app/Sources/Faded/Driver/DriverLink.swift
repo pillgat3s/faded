@@ -16,6 +16,10 @@ final class DriverLink {
 
     private(set) var status: Status = .notInstalled
     private(set) var outputDevice: AudioDevice?
+    /// Device id of the Faded device last time we looked. coreaudiod hands out
+    /// fresh ids when it restarts, so a change here means the driver was
+    /// reloaded underneath us and everything built on top of it is stale.
+    private var lastDeviceID: AudioDeviceID?
 
     private var clientListener: ListenerToken?
     private var deviceListListener: ListenerToken?
@@ -45,6 +49,9 @@ final class DriverLink {
             if previous != status { onAvailabilityChanged?() }
             return
         }
+        let deviceChanged = lastDeviceID != nil && lastDeviceID != outID
+        driverWasReloaded = deviceChanged
+        lastDeviceID = outID
         outputDevice = out
 
         let version = AudioObject.getString(outID, .init(FadedProtocol.Prop.version)) ?? "?"
@@ -59,8 +66,12 @@ final class DriverLink {
                 Task { @MainActor in self?.onClientsChanged?() }
             }
         }
-        if previous != status { onAvailabilityChanged?() }
+        if previous != status || deviceChanged { onAvailabilityChanged?() }
     }
+
+    /// True when the driver has been reloaded since the last refresh — the app
+    /// must tear down and rebuild anything derived from it.
+    private(set) var driverWasReloaded = false
 
     var isReady: Bool { status == .ready }
 

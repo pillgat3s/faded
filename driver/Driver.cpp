@@ -114,10 +114,23 @@ AudioStreamBasicDescription floatFormat(Float64 rate)
     return f;
 }
 
+// One rate, deliberately.
+//
+// libASPL's SetNominalSampleRateImpl only records the number; it does not
+// re-format the device's streams, and asking the streams to change format
+// afterwards does not take either (verified: set nominal to 44100 and the
+// stream stays at 48000). coreaudiod clocks I/O from the *stream* format, so a
+// re-rated device ends up advertising one rate while genuinely producing
+// another — and since the shared ring carries frames with no clock of their
+// own, the consumer then plays at the wrong speed and glitches continuously.
+//
+// Advertising a single rate makes that divergence impossible. coreaudiod
+// resamples client audio into it exactly as it would for any fixed-rate
+// interface, and the app's output unit converts to whatever the real device
+// wants, so nothing is lost but a whole class of bug.
 std::vector<AudioValueRange> supportedRates()
 {
-    auto r = [](double v) { return AudioValueRange{v, v}; };
-    return {r(kFadedSampleRate44k), r(kFadedSampleRate48k), r(kFadedSampleRate88k), r(kFadedSampleRate96k)};
+    return {AudioValueRange{kFadedDefaultSampleRate, kFadedDefaultSampleRate}};
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +282,11 @@ public:
 
     void OnStopIO() override
     {
+        // Drop whatever cycle was still accumulating. It is at most one buffer
+        // at the very end of a stream, and publishing it from a control thread
+        // would race the I/O thread that owns the accumulator.
+        mixFrames_ = 0;
+        mixTimestamp_ = -1.0;
         SharedRing::shared().setRunning(false);
         running_.store(false, std::memory_order_relaxed);
         masterPeakL.store(0.0f, std::memory_order_relaxed);
@@ -307,33 +325,68 @@ public:
         fc->peak.store(peak > prev ? peak : prev, std::memory_order_relaxed);
     }
 
-    void OnProcessMixedOutput(const std::shared_ptr<aspl::Stream>& stream,
+    /// Per-client output is only dispatched when EnableMixing is false, which
+    /// means libASPL no longer mixes for us — this does.
+    ///
+    /// The HAL calls this once per client per I/O cycle, with the same
+    /// `timestamp` for every client in a cycle. Clients are accumulated into a
+    /// scratch buffer and the finished mix is pushed to the ring when the
+    /// *next* cycle starts (or when I/O stops), which is the only moment we can
+    /// know every client has contributed. That costs one cycle of latency and
+    /// guarantees the reader never sees a half-mixed buffer.
+    void OnWriteClientOutput(const std::shared_ptr<aspl::Client>& /*client*/,
+        const std::shared_ptr<aspl::Stream>& stream,
         Float64 /*zeroTimestamp*/,
-        Float64 /*timestamp*/,
-        Float32* frames,
+        Float64 timestamp,
+        const Float32* frames,
         UInt32 frameCount,
         UInt32 channelCount) override
     {
-        // When bypassed, Faded.app mirrors the volume/mute controls onto the
-        // real device's hardware gain instead, so we must NOT attenuate here.
-        if (!bypassMaster.load(std::memory_order_relaxed)) {
-            stream->ApplyProcessing(frames, frameCount, channelCount);
+        if (channelCount != kFadedChannelCount) {
+            return;
+        }
+        const UInt32 samples = frameCount * channelCount;
+        if (samples > kMixCapacity) {
+            return; // absurd buffer size; refuse rather than overrun
+        }
+
+        if (timestamp != mixTimestamp_ || frameCount != mixFrames_) {
+            flushMix(stream);
+            mixTimestamp_ = timestamp;
+            mixFrames_ = frameCount;
+            std::memset(mix_, 0, sizeof(Float32) * samples);
+        }
+
+        for (UInt32 i = 0; i < samples; ++i) {
+            mix_[i] += frames[i];
         }
     }
 
-    void OnWriteMixedOutput(const std::shared_ptr<aspl::Stream>& /*stream*/,
-        Float64 /*zeroTimestamp*/,
-        Float64 /*timestamp*/,
-        const void* bytes,
-        UInt32 bytesCount) override
+    /// Publishes the accumulated cycle: master volume, meter, then the ring.
+    /// Only ever called from the real-time thread, with the stream that is
+    /// currently being served — the stream is deliberately not cached between
+    /// calls, because assigning a shared_ptr on the I/O thread while a control
+    /// thread clears it is a data race.
+    void flushMix(const std::shared_ptr<aspl::Stream>& stream)
     {
-        const auto* frames = static_cast<const Float32*>(bytes);
-        const UInt32 frameCount = bytesCount / (sizeof(Float32) * kFadedChannelCount);
+        if (mixFrames_ == 0) {
+            return;
+        }
+        const UInt32 frameCount = mixFrames_;
+        mixFrames_ = 0;
+
+        // libASPL applies the device's volume/mute controls through the
+        // stream. With mixing disabled it never gets the chance, so do it here
+        // — once, on the mix, not once per client. Skipped when the app is
+        // mirroring the level onto real hardware instead.
+        if (stream && !bypassMaster.load(std::memory_order_relaxed)) {
+            stream->ApplyProcessing(mix_, frameCount, kFadedChannelCount);
+        }
 
         float pl = 0.0f, pr = 0.0f;
         for (UInt32 i = 0; i < frameCount; ++i) {
-            const float l = std::fabs(frames[i * 2]);
-            const float r = std::fabs(frames[i * 2 + 1]);
+            const float l = std::fabs(mix_[i * 2]);
+            const float r = std::fabs(mix_[i * 2 + 1]);
             pl = l > pl ? l : pl;
             pr = r > pr ? r : pr;
         }
@@ -342,7 +395,7 @@ public:
         masterPeakL.store(pl > prevL ? pl : prevL, std::memory_order_relaxed);
         masterPeakR.store(pr > prevR ? pr : prevR, std::memory_order_relaxed);
 
-        SharedRing::shared().write(frames, frameCount);
+        SharedRing::shared().write(mix_, frameCount);
     }
 
     // -- app-facing state ---------------------------------------------
@@ -360,6 +413,13 @@ public:
     std::map<std::string, float> gains;
 
 private:
+    // Cycle accumulator for our own mixing. Real-time thread only, so plain
+    // members: the HAL serialises the per-client calls within a cycle.
+    static constexpr UInt32 kMixCapacity = 8192 * kFadedChannelCount;
+    Float32 mix_[kMixCapacity] = {};
+    Float64 mixTimestamp_ = -1.0;
+    UInt32 mixFrames_ = 0;
+
     std::weak_ptr<FadedOutputDevice> device_;
     std::atomic<bool> running_{false};
 };
@@ -445,9 +505,12 @@ public:
     OSStatus SetNominalSampleRateImpl(Float64 rate) override
     {
         const OSStatus status = aspl::Device::SetNominalSampleRateImpl(rate);
-        if (status == kAudioHardwareNoError) {
-            SharedRing::shared().setSampleRate(static_cast<UInt32>(rate));
-        }
+        // Whatever the nominal rate ends up saying, publish the rate frames are
+        // genuinely produced at — the stream's. Only one rate is advertised, so
+        // in practice these always agree; this is here so that if they ever
+        // diverge again the consumer still hears the truth rather than a
+        // property that lies.
+        publishCurrentSampleRate();
         return status;
     }
 
@@ -455,7 +518,18 @@ public:
     //! must open its output at.
     void publishCurrentSampleRate()
     {
-        SharedRing::shared().setSampleRate(static_cast<UInt32>(GetNominalSampleRate()));
+        // Deliberately the *stream's* rate, not GetNominalSampleRate(): the
+        // stream format is what coreaudiod clocks I/O from, so it is the rate
+        // frames genuinely arrive at. The two should now always agree, and if
+        // they ever diverge again the stream is the one telling the truth.
+        Float64 rate = GetNominalSampleRate();
+        if (auto stream = GetStreamByIndex(aspl::Direction::Output, 0)) {
+            const Float64 streamRate = stream->GetPhysicalFormat().mSampleRate;
+            if (streamRate > 0) {
+                rate = streamRate;
+            }
+        }
+        SharedRing::shared().setSampleRate(static_cast<UInt32>(rate));
     }
 
     //! Reports whatever Faded.app last set, so the system volume HUD names the
@@ -571,6 +645,8 @@ OSStatus OutputHandler::OnStartIO()
     if (auto dev = device_.lock()) {
         dev->publishCurrentSampleRate();
     }
+    mixTimestamp_ = -1.0;
+    mixFrames_ = 0;
     SharedRing::shared().setRunning(true);
     running_.store(true, std::memory_order_relaxed);
     return kAudioHardwareNoError;
@@ -617,7 +693,13 @@ std::shared_ptr<aspl::Driver> CreateFadedDriver()
     outParams.CanBeDefaultForSystemSounds = true;
     outParams.SampleRate = kFadedDefaultSampleRate;
     outParams.ChannelCount = kFadedChannelCount;
-    outParams.EnableMixing = true;
+    // False, deliberately. With mixing enabled libASPL declines the HAL's
+    // per-client "MixOutput" operation entirely, which is the only place
+    // OnProcessClientOutput is dispatched from — so per-app gain was never
+    // applied and every client's peak stayed at zero, leaving the Apps list
+    // permanently empty. Taking the per-client callbacks means mixing the
+    // clients together ourselves; see OnWriteClientOutput.
+    outParams.EnableMixing = false;
     // Report a small, honest latency so apps' A/V sync accounts for the hop
     // through the app. Real total ≈ FIFO prime + two AUHAL buffers.
     outParams.Latency = 512;

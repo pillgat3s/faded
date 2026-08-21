@@ -85,7 +85,11 @@ nothing of Faded's can ever turn up in Discord's microphone picker.
 
 **Per-app volume.** The `AudioServerPlugIn` API hands the driver each client's
 buffer *before* mixing, along with its pid and bundle id, so gain is applied
-there. Helper processes (Chrome Helper, WebKit GPU, Discord Helper) are
+there. Getting those callbacks means declining libASPL's built-in mixing
+(`EnableMixing = false`) — with it on, the device never opts into the HAL's
+per-client operation at all, and `OnProcessClientOutput` is simply never
+dispatched. The driver therefore mixes the clients itself, accumulating a cycle
+and publishing it when the next one begins. Helper processes (Chrome Helper, WebKit GPU, Discord Helper) are
 resolved back to their owning app for display. Only apps that have recently
 produced a signal are listed — otherwise you get every daemon on the system
 that happens to hold the device open.
@@ -222,7 +226,11 @@ turn one on.
   Hiding Faded from those lists would have been tidier, and was tried: **macOS
   refuses to use a device with `kAudioDevicePropertyIsHidden` as the default
   output**, so that idea is settled and the setting is gone.
-- Adds roughly 5–15 ms of latency.
+- Adds roughly 10–20 ms of latency (one I/O cycle of it is the mix accumulator).
+- The virtual device advertises a single sample rate (48 kHz) on purpose:
+  libASPL records a new nominal rate without re-formatting its streams, so a
+  re-ratable device ends up advertising one rate while producing another, and
+  the shared ring — which carries no clock — cannot tell.
 - Input volume only works on devices that expose a hardware input control.
 - Not suitable for bit-perfect playback chains — there is an extra hop.
 - Apple silicon only as configured; the app is universal but the driver builds

@@ -516,6 +516,19 @@ final class AudioRouter {
 
     private func driverAvailabilityChanged() {
         driverStatus = driver.status
+
+        // coreaudiod restarted (driver reinstalled, or macOS restarted it on
+        // its own). Every handle we hold is stale: the audio unit is dead, and
+        // the shared-memory mapping points at the *previous* driver's segment,
+        // which was unlinked and will never be written to again. Nothing about
+        // that is visible as an error — the app would just play silence for
+        // ever while still believing it was engaged. Tear it all down and
+        // build it again.
+        if driver.driverWasReloaded, isEngaged {
+            Self.log.info("driver was reloaded — rebuilding the audio path")
+            disengage(restoreDefault: false)
+        }
+
         if !driver.isReady, isEngaged {
             disengage(restoreDefault: true)
         } else if driver.isReady, enabled, !isEngaged {
