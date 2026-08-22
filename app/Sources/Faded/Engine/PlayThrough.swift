@@ -26,8 +26,8 @@ final class PlayThrough: @unchecked Sendable {
     private(set) var sampleRate: Double = 0
     private(set) var outputDeviceID: AudioDeviceID = kAudioObjectUnknown
 
-    var stats: (underruns: UInt64, resyncs: UInt64, overruns: UInt64, producing: Bool) {
-        (reader.underruns, reader.resyncs, reader.overruns, reader.producerRunning)
+    var stats: (underruns: UInt64, resyncs: UInt64, overruns: UInt64, producing: Bool, fill: Double, driftPPM: Double) {
+        (reader.underruns, reader.resyncs, reader.overruns, reader.producerRunning, reader.fill, reader.driftPPM)
     }
 
     deinit { stop() }

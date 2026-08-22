@@ -165,6 +165,8 @@ final class AudioRouter {
     private var fadedRateListener: ListenerToken?
     private var inputControlListeners: [ListenerToken] = []
     private var meterTimer: Timer?
+    private var healthTimer: Timer?
+    private var lastHealth: (under: UInt64, resync: UInt64) = (0, 0)
     private var adoptRetry: DispatchWorkItem?
     private var idleTicks = 0
 
@@ -286,6 +288,7 @@ final class AudioRouter {
         setSystemDefault(to: faded.id)
         installFadedControlListeners()
         installTargetListeners()
+        startHealthLogging()
         driver.setDisplayName(initialTarget.name)
         pushAllAppGains()
         applyVolumeForTarget()
@@ -296,6 +299,8 @@ final class AudioRouter {
 
     func disengage(restoreDefault: Bool) {
         guard isEngaged else { return }
+        healthTimer?.invalidate()
+        healthTimer = nil
         engine.stop()
         fadedControlListeners.removeAll()
         targetControlListeners.removeAll()
@@ -315,6 +320,33 @@ final class AudioRouter {
     func shutdown() {
         inputMeter.stop()
         disengage(restoreDefault: true)
+    }
+
+    /// Glitches that happen "sometimes" cannot be caught live, so the engine
+    /// leaves a trail: whenever a dropout or a resync actually occurs it is
+    /// logged at notice level (which persists), along with the state of the
+    /// drift loop at that moment. Afterwards,
+    ///   log show --predicate 'subsystem == "com.andri.faded"' --last 1h
+    /// answers what happened and when, instead of relying on someone noticing
+    /// a click and remembering what they were doing.
+    private func startHealthLogging() {
+        healthTimer?.invalidate()
+        lastHealth = (0, 0)
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.logHealth() }
+        }
+    }
+
+    private func logHealth() {
+        guard isEngaged else { return }
+        let e = engine.stats
+        guard e.underruns != lastHealth.under || e.resyncs != lastHealth.resync else { return }
+        let newUnder = e.underruns &- lastHealth.under
+        let newResync = e.resyncs &- lastHealth.resync
+        lastHealth = (e.underruns, e.resyncs)
+        let fill = Int(e.fill)
+        let ppm = Int(e.driftPPM)
+        Self.log.notice("audio dropout: \(newUnder) underrun(s), \(newResync) resync(s) — fill \(fill) frames, drift correction \(ppm) ppm")
     }
 
     // MARK: Output selection
@@ -991,6 +1023,8 @@ final class AudioRouter {
         s += "output has hw volume: \(target?.hasHardwareVolume ?? false) (false ⇒ Faded applies it in software)\n"
         let e = engine.stats
         s += "engine: rate=\(engine.sampleRate) under=\(e.underruns) resync=\(e.resyncs) over=\(e.overruns) producing=\(e.producing)\n"
+        s += String(format: "drift loop: fill=%.0f frames (target %d) correction=%+.0f ppm\n",
+                    e.fill, Int(kFadedRingPrimeFrames), e.driftPPM)
         for (k, v) in driver.stats().sorted(by: { $0.key < $1.key }) { s += "\(k)=\(v) " }
         if let err = lastError { s += "\nlast error: \(err)" }
         return s

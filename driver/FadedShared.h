@@ -116,6 +116,44 @@ static inline uint64_t FadedSharedRingOverruns(const FadedSharedRing* ring)
     return FADED_LOAD((FADED_ATOMIC(uint64_t)*)&ring->overruns, memory_order_relaxed);
 }
 
+/// Reads `frameCount` frames starting at the fractional position
+/// (`*posInt` + `*posFrac`), advancing by `step` per output frame, with linear
+/// interpolation between neighbouring frames.
+///
+/// This is what compensates for clock drift. The producer is clocked by
+/// coreaudiod and the consumer by the real output device's own crystal; those
+/// disagree by of the order of 100 ppm, so with a fixed read rate the buffer
+/// between them inevitably drains or fills until it glitches — a click every
+/// few minutes, at no predictable moment. Reading at a rate nudged very
+/// slightly (a fraction of a percent) toward whatever keeps the buffer at its
+/// target level removes the drift instead of postponing it.
+///
+/// `step` stays within a hair of 1.0, so linear interpolation is inaudible
+/// here; it is doing sub-sample alignment, not real resampling.
+static inline void FadedSharedRingResample(const FadedSharedRing* ring,
+                                           uint64_t* posInt,
+                                           double* posFrac,
+                                           double step,
+                                           float* dst,
+                                           uint32_t frameCount)
+{
+    uint64_t p = *posInt;
+    double frac = *posFrac;
+    for (uint32_t n = 0; n < frameCount; ++n) {
+        const uint32_t i0 = (uint32_t)(p & kFadedRingMask) * kFadedRingChannels;
+        const uint32_t i1 = (uint32_t)((p + 1) & kFadedRingMask) * kFadedRingChannels;
+        const float w = (float)frac;
+        dst[n * 2] = ring->samples[i0] + (ring->samples[i1] - ring->samples[i0]) * w;
+        dst[n * 2 + 1] = ring->samples[i0 + 1] + (ring->samples[i1 + 1] - ring->samples[i0 + 1]) * w;
+        frac += step;
+        // step is always within a few thousandths of 1.0, so this runs at most
+        // twice — no need for floor() and its header.
+        while (frac >= 1.0) { frac -= 1.0; p += 1; }
+    }
+    *posInt = p;
+    *posFrac = frac;
+}
+
 /// Copies `frameCount` frames ending at `fromIndex` into `dst`, wrapping as
 /// needed. The caller has already established that the range is still live.
 static inline void FadedSharedRingCopyOut(const FadedSharedRing* ring,

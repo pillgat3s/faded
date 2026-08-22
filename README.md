@@ -75,7 +75,22 @@ So the audio does not travel over an audio device at all. The driver publishes
 a POSIX shared-memory ring (`driver/FadedShared.h`) and the app maps it
 read-only, pulling frames straight from it inside its output render callback.
 Single producer, single consumer, no locks; the read cursor lives in the app's
-own memory, which is why the mapping never needs write access. The app opens
+own memory, which is why the mapping never needs write access.
+
+The two ends run on **different clocks** — the driver on coreaudiod's, the app
+on the real output device's crystal — which disagree by around 100 ppm. Reading
+one frame for every frame written therefore drains or fills the buffer until it
+glitches, giving a click every few minutes at no predictable moment. A bigger
+buffer only changes how long you wait for it. Instead a slow control loop
+watches the fill level and nudges the read rate by a fraction of a percent
+(bounded at 0.3%, roughly thirty times the headroom real drift needs) to hold
+it at target, which cancels the drift rather than postponing it. Dropouts that
+do still happen are logged at notice level with the loop's state, so an
+intermittent glitch leaves evidence:
+
+```bash
+log show --predicate 'subsystem == "com.andri.faded"' --last 1h | grep dropout
+``` The app opens
 only an *output* unit, so no indicator appears — and the whole tap device, plus
 a buffer of latency, disappeared with it.
 
