@@ -264,10 +264,17 @@ struct MenuView: View {
             ForEach(visibleAppRows) { app in
                 appRow(app)
             }
-            if visibleAppRows.isEmpty {
+            // Only say nothing is playing when nothing actually is. A collapsed
+            // section with unstarred apps behind it has no rows to show, but
+            // the header's count is already telling the truth.
+            if router.apps.isEmpty {
                 Text("Nothing is playing audio.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                     .padding(.horizontal, 16).padding(.vertical, 4)
+            } else if visibleAppRows.isEmpty {
+                Text("Open Apps to set levels, or star an app to keep it here.")
+                    .font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                    .padding(.horizontal, 16).padding(.vertical, 2)
             }
         }
         .padding(.bottom, 6)
