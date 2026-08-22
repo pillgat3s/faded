@@ -187,6 +187,10 @@
 
   function setGain(value) {
     const next = clamp(Number(value));
+    // Recorded even when unchanged: this is the only externally visible proof
+    // that a level actually reached the page, which makes "the slider does
+    // nothing" answerable without guessing at which link in the chain broke.
+    window.__fadedTabs = { gain: next, receivedAt: Date.now(), applied: next !== gain };
     if (next === gain) return;
     gain = next;
     applyToAllElements();

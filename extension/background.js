@@ -136,12 +136,16 @@ chrome.runtime.onStartup.addListener(injectExistingTabs);
 
 /// Is a tab hooked? Used to warn in the popup rather than fail silently.
 async function isHooked(tabId) {
-  try {
-    const reply = await chrome.tabs.sendMessage(tabId, { type: 'ping' }, { frameId: 0 });
-    return reply?.hooked === true;
-  } catch (_) {
-    return false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const reply = await chrome.tabs.sendMessage(tabId, { type: 'ping' }, { frameId: 0 });
+      if (reply?.hooked === true) return true;
+    } catch (_) {
+      // A content script that is still coming up rejects rather than replying.
+    }
+    if (attempt === 0) await new Promise((r) => setTimeout(r, 60));
   }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +166,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       // Popup: give me every tab worth showing.
       case 'listTabs': {
-        const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+        // lastFocusedWindow, not currentWindow: this runs in the service
+        // worker, which has no window of its own, so "current" is meaningless
+        // here and can come back empty.
+        const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
         const audible = await chrome.tabs.query({ audible: true });
         const tabs = await tabGains();
 

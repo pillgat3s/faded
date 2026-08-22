@@ -101,16 +101,17 @@ function render(tabs) {
 
     if (!tab.adjustable) {
       value.nodeValue = 'n/a';
-    } else if (tab.hooked === false) {
-      // The page has no hooks — almost always a tab that predates the
-      // extension being loaded. Say so instead of moving a slider that does
-      // nothing.
-      value.nodeValue = 'reload';
-      slider.disabled = true;
-      row.title = 'Reload this tab to control its volume';
-      title.style.opacity = '0.6';
     } else {
       value.nodeValue = `${Math.round(slider.value)}%`;
+      if (tab.hooked === false) {
+        // Probably a tab that predates the extension being loaded. Flag it, but
+        // deliberately leave the slider working: the probe is a single message
+        // round-trip and can come back false for uninteresting reasons — a
+        // service worker that just woke, a frame that answers late — and a
+        // warning that disables the control is worse than no warning at all.
+        row.title = 'This tab may not have responded — reload it if the slider has no effect';
+        title.style.opacity = '0.75';
+      }
     }
 
     const mute = document.createElement('button');
