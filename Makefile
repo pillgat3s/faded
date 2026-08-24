@@ -29,7 +29,7 @@ CONFIG     ?= Release
 -include $(ROOT)/local.mk
 CODESIGN_ID ?= -
 
-.PHONY: all driver app install reinstall check-clients install-driver uninstall-driver uninstall check-protocol clean
+.PHONY: all driver app install reinstall check-clients check-rate install-driver uninstall-driver uninstall check-protocol clean
 
 all: driver app
 
@@ -73,6 +73,11 @@ reinstall: all
 # a non-zero peak; if everything reads 0 the per-client path is not running.
 check-clients:
 	@python3 $(ROOT)/scripts/check-clients.py
+
+# Confirms the driver produces audio at real time. Anything but ~0% error is
+# heard as robotic, stuttering audio.
+check-rate:
+	@python3 $(ROOT)/scripts/check-producer-rate.py
 
 install-driver: driver
 	sudo $(ROOT)/scripts/install-driver.sh $(DRIVER_DIR)/build/FadedDriver.driver

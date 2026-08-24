@@ -30,6 +30,9 @@ final class PlayThrough: @unchecked Sendable {
         (reader.underruns, reader.resyncs, reader.overruns, reader.producerRunning, reader.fill, reader.driftPPM)
     }
 
+    /// Level of what is actually reaching the speakers.
+    var outputPeak: (Float, Float) { reader.outputPeak }
+
     deinit { stop() }
 
     // MARK: Lifecycle

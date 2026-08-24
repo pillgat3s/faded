@@ -61,6 +61,13 @@ final class SharedRingReader: @unchecked Sendable {
     private(set) var underruns: UInt64 = 0
     private(set) var resyncs: UInt64 = 0
 
+    /// Output meter, measured on exactly the frames that go to the speakers.
+    /// The driver no longer assembles a mix anywhere — clients sum straight
+    /// into the ring — so this end is the only place the finished signal
+    /// exists to be measured.
+    private let meterLock = OSAllocatedUnfairLock(initialState: (l: Float(0), r: Float(0)))
+    var outputPeak: (Float, Float) { meterLock.withLock { ($0.l, $0.r) } }
+
     var isOpen: Bool { ring != nil }
 
     deinit { close() }
@@ -180,12 +187,29 @@ final class SharedRingReader: @unchecked Sendable {
         guard available >= required else {
             // Genuinely out of data — the producer stalled rather than drifted.
             silence(dst, frames)
+            meterLock.withLock { $0 = (0, 0) }
             underruns &+= 1
             primed = false
             return
         }
 
         FadedSharedRingResample(ring, &posInt, &posFrac, step, dst, frames)
+        measure(dst, frames)
+    }
+
+    /// Decaying peak-hold over the frames just produced.
+    private func measure(_ src: UnsafePointer<Float>, _ frames: UInt32) {
+        var l: Float = 0
+        var r: Float = 0
+        for i in 0 ..< Int(frames) {
+            l = max(l, abs(src[i * 2]))
+            r = max(r, abs(src[i * 2 + 1]))
+        }
+        let peakL = l, peakR = r   // let-bound: the lock's closure is Sendable
+        meterLock.withLock { state in
+            state.l = max(peakL, state.l * 0.85)
+            state.r = max(peakR, state.r * 0.85)
+        }
     }
 
     private func silence(_ dst: UnsafeMutablePointer<Float>, _ frames: UInt32) {

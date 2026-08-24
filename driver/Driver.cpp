@@ -168,28 +168,69 @@ public:
         }
     }
 
-    /// Real-time thread. Free-running writer: never waits, never reads the
-    /// consumer's position.
-    void write(const Float32* frames, UInt32 frameCount)
+    /// Real-time thread. Mixes one client's buffer into the ring at an
+    /// absolute frame position and publishes how far the device has got.
+    ///
+    /// Positions come from the HAL's own output sample time, so the ring is
+    /// addressed by the device's frame clock rather than by counting calls.
+    /// That matters: the HAL delivers one buffer *per client* per cycle, so
+    /// anything that advances the write index once per call runs at N times
+    /// real time with N apps playing — which sounds like a robot, because the
+    /// consumer is being handed twice the audio a second and spends its life
+    /// resynchronising. Addressing by position makes the number of clients
+    /// irrelevant: two apps writing the same cycle land on the same frames and
+    /// sum, exactly as they should.
+    void mixInAt(uint64_t frameIndex, const Float32* frames, UInt32 frameCount)
     {
         if (!ring_ || frameCount == 0) return;
 
-        const uint64_t w = std::atomic_load_explicit(&ring_->writeIndex, std::memory_order_relaxed);
-        const uint32_t start = static_cast<uint32_t>(w & kFadedRingMask);
-        const uint32_t first = std::min(frameCount, kFadedRingFrames - start);
-
-        std::memcpy(&ring_->samples[start * kFadedRingChannels], frames,
-            sizeof(Float32) * first * kFadedRingChannels);
-        if (frameCount > first) {
-            std::memcpy(&ring_->samples[0], frames + first * kFadedRingChannels,
-                sizeof(Float32) * (frameCount - first) * kFadedRingChannels);
+        // First buffer of a stream: anchor the ring to wherever the device's
+        // clock happens to be.
+        if (!anchored_) {
+            anchored_ = true;
+            highWater_ = frameIndex;
+            std::atomic_store_explicit(&ring_->writeIndex, frameIndex, std::memory_order_release);
         }
 
-        // Release: everything above is visible before the reader sees the index.
-        std::atomic_store_explicit(&ring_->writeIndex, w + frameCount, std::memory_order_release);
+        const uint64_t end = frameIndex + frameCount;
+
+        // Frames past the high-water mark have never been written and still
+        // hold whatever the previous lap left behind, so clear them before
+        // summing into them.
+        if (end > highWater_) {
+            const uint64_t from = highWater_ > frameIndex ? highWater_ : frameIndex;
+            zeroRange(from, static_cast<UInt32>(end - from));
+            highWater_ = end;
+        }
+
+        for (UInt32 i = 0; i < frameCount; ++i) {
+            const uint32_t slot = static_cast<uint32_t>((frameIndex + i) & kFadedRingMask) * kFadedRingChannels;
+            ring_->samples[slot] += frames[i * kFadedRingChannels];
+            ring_->samples[slot + 1] += frames[i * kFadedRingChannels + 1];
+        }
+
+        // Release: the samples above are visible before the reader sees them.
+        std::atomic_store_explicit(&ring_->writeIndex, highWater_, std::memory_order_release);
     }
 
+    void unanchor() { anchored_ = false; }
+
     const char* status() const { return status_; }
+
+private:
+    void zeroRange(uint64_t index, UInt32 frameCount)
+    {
+        const uint32_t start = static_cast<uint32_t>(index & kFadedRingMask);
+        const uint32_t first = std::min(frameCount, kFadedRingFrames - start);
+        std::memset(&ring_->samples[start * kFadedRingChannels], 0,
+            sizeof(Float32) * first * kFadedRingChannels);
+        if (frameCount > first) {
+            std::memset(&ring_->samples[0], 0,
+                sizeof(Float32) * (frameCount - first) * kFadedRingChannels);
+        }
+    }
+
+public:
 
 private:
     SharedRing()
@@ -235,6 +276,8 @@ private:
     }
 
     FadedSharedRing* ring_ = nullptr;
+    uint64_t highWater_ = 0;
+    bool anchored_ = false;
     char status_[160] = "uninitialised";
 };
 
@@ -282,21 +325,15 @@ public:
 
     void OnStopIO() override
     {
-        // Drop whatever cycle was still accumulating. It is at most one buffer
-        // at the very end of a stream, and publishing it from a control thread
-        // would race the I/O thread that owns the accumulator.
-        mixFrames_ = 0;
-        mixTimestamp_ = -1.0;
+        SharedRing::shared().unanchor();
         SharedRing::shared().setRunning(false);
         running_.store(false, std::memory_order_relaxed);
-        masterPeakL.store(0.0f, std::memory_order_relaxed);
-        masterPeakR.store(0.0f, std::memory_order_relaxed);
     }
 
     // -- I/O (real-time thread) -----------------------------------------
 
     void OnProcessClientOutput(const std::shared_ptr<aspl::Client>& client,
-        const std::shared_ptr<aspl::Stream>& /*stream*/,
+        const std::shared_ptr<aspl::Stream>& stream,
         Float64 /*zeroTimestamp*/,
         Float64 /*timestamp*/,
         Float32* frames,
@@ -320,82 +357,36 @@ public:
                 peak = a > peak ? a : peak;
             }
         }
-        // Decaying peak-hold: fast attack, ~0.9× per cycle release.
+        // Decaying peak-hold: fast attack, ~0.9× per cycle release. Measured
+        // before master volume so the meter shows the app's own level.
         const float prev = fc->peak.load(std::memory_order_relaxed) * 0.9f;
         fc->peak.store(peak > prev ? peak : prev, std::memory_order_relaxed);
+
+        // Master volume and mute are plain scalars, so scaling each client
+        // before they are summed gives exactly the same result as scaling the
+        // sum — and it means the mix never has to be assembled anywhere but in
+        // the ring itself. Skipped when the app is mirroring the level onto
+        // real hardware instead.
+        if (stream && !bypassMaster.load(std::memory_order_relaxed)) {
+            stream->ApplyProcessing(frames, frameCount, channelCount);
+        }
     }
 
-    /// Per-client output is only dispatched when EnableMixing is false, which
-    /// means libASPL no longer mixes for us — this does.
-    ///
-    /// The HAL calls this once per client per I/O cycle, with the same
-    /// `timestamp` for every client in a cycle. Clients are accumulated into a
-    /// scratch buffer and the finished mix is pushed to the ring when the
-    /// *next* cycle starts (or when I/O stops), which is the only moment we can
-    /// know every client has contributed. That costs one cycle of latency and
-    /// guarantees the reader never sees a half-mixed buffer.
+    /// Sums this client's (already gain-adjusted) buffer into the ring at the
+    /// position the HAL gave it. No cycle detection, no accumulator, and
+    /// nothing that depends on how many clients are playing.
     void OnWriteClientOutput(const std::shared_ptr<aspl::Client>& /*client*/,
-        const std::shared_ptr<aspl::Stream>& stream,
+        const std::shared_ptr<aspl::Stream>& /*stream*/,
         Float64 /*zeroTimestamp*/,
         Float64 timestamp,
         const Float32* frames,
         UInt32 frameCount,
         UInt32 channelCount) override
     {
-        if (channelCount != kFadedChannelCount) {
+        if (channelCount != kFadedChannelCount || timestamp < 0) {
             return;
         }
-        const UInt32 samples = frameCount * channelCount;
-        if (samples > kMixCapacity) {
-            return; // absurd buffer size; refuse rather than overrun
-        }
-
-        if (timestamp != mixTimestamp_ || frameCount != mixFrames_) {
-            flushMix(stream);
-            mixTimestamp_ = timestamp;
-            mixFrames_ = frameCount;
-            std::memset(mix_, 0, sizeof(Float32) * samples);
-        }
-
-        for (UInt32 i = 0; i < samples; ++i) {
-            mix_[i] += frames[i];
-        }
-    }
-
-    /// Publishes the accumulated cycle: master volume, meter, then the ring.
-    /// Only ever called from the real-time thread, with the stream that is
-    /// currently being served — the stream is deliberately not cached between
-    /// calls, because assigning a shared_ptr on the I/O thread while a control
-    /// thread clears it is a data race.
-    void flushMix(const std::shared_ptr<aspl::Stream>& stream)
-    {
-        if (mixFrames_ == 0) {
-            return;
-        }
-        const UInt32 frameCount = mixFrames_;
-        mixFrames_ = 0;
-
-        // libASPL applies the device's volume/mute controls through the
-        // stream. With mixing disabled it never gets the chance, so do it here
-        // — once, on the mix, not once per client. Skipped when the app is
-        // mirroring the level onto real hardware instead.
-        if (stream && !bypassMaster.load(std::memory_order_relaxed)) {
-            stream->ApplyProcessing(mix_, frameCount, kFadedChannelCount);
-        }
-
-        float pl = 0.0f, pr = 0.0f;
-        for (UInt32 i = 0; i < frameCount; ++i) {
-            const float l = std::fabs(mix_[i * 2]);
-            const float r = std::fabs(mix_[i * 2 + 1]);
-            pl = l > pl ? l : pl;
-            pr = r > pr ? r : pr;
-        }
-        const float prevL = masterPeakL.load(std::memory_order_relaxed) * 0.85f;
-        const float prevR = masterPeakR.load(std::memory_order_relaxed) * 0.85f;
-        masterPeakL.store(pl > prevL ? pl : prevL, std::memory_order_relaxed);
-        masterPeakR.store(pr > prevR ? pr : prevR, std::memory_order_relaxed);
-
-        SharedRing::shared().write(mix_, frameCount);
+        SharedRing::shared().mixInAt(static_cast<uint64_t>(timestamp), frames, frameCount);
     }
 
     // -- app-facing state ---------------------------------------------
@@ -403,23 +394,13 @@ public:
     std::atomic<bool> bypassMaster{false};
     bool isRunning() const { return running_.load(std::memory_order_relaxed); }
 
-    // Master output meter, written on the RT thread, read by the app via
-    // kFadedProp_Stats. Decaying peak-hold, same shape as the per-client one.
-    std::atomic<float> masterPeakL{0.0f};
-    std::atomic<float> masterPeakR{0.0f};
+
 
     // Per-app gains keyed by bundle id (or "pid:N"). Control thread only.
     std::mutex gainsMutex;
     std::map<std::string, float> gains;
 
 private:
-    // Cycle accumulator for our own mixing. Real-time thread only, so plain
-    // members: the HAL serialises the per-client calls within a cycle.
-    static constexpr UInt32 kMixCapacity = 8192 * kFadedChannelCount;
-    Float32 mix_[kMixCapacity] = {};
-    Float64 mixTimestamp_ = -1.0;
-    UInt32 mixFrames_ = 0;
-
     std::weak_ptr<FadedOutputDevice> device_;
     std::atomic<bool> running_{false};
 };
@@ -624,8 +605,6 @@ private:
             &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         dictSet(d, "sampleRate", makeCFNumber(GetNominalSampleRate()));
         dictSet(d, "clients", makeCFNumber(static_cast<long long>(GetClientCount())));
-        dictSet(d, "peakL", makeCFNumber(static_cast<double>(handler_->masterPeakL.load())));
-        dictSet(d, "peakR", makeCFNumber(static_cast<double>(handler_->masterPeakR.load())));
         dictSet(d, "sharedRing", makeCFString(SharedRing::shared().status()));
         CFBooleanRef out = handler_->isRunning() ? kCFBooleanTrue : kCFBooleanFalse;
         CFRetain(out);
@@ -645,8 +624,7 @@ OSStatus OutputHandler::OnStartIO()
     if (auto dev = device_.lock()) {
         dev->publishCurrentSampleRate();
     }
-    mixTimestamp_ = -1.0;
-    mixFrames_ = 0;
+    SharedRing::shared().unanchor();
     SharedRing::shared().setRunning(true);
     running_.store(true, std::memory_order_relaxed);
     return kAudioHardwareNoError;

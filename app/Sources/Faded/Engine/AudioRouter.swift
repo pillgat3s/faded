@@ -942,8 +942,7 @@ final class AudioRouter {
         }
 
         guard isEngaged else { outputLevel = (0, 0); return }
-        let stats = driver.stats()
-        outputLevel = (Float(stats["peakL"] as? Double ?? 0), Float(stats["peakR"] as? Double ?? 0))
+        outputLevel = engine.outputPeak
 
         let clients = driver.clients()
         var peakByKey: [String: Float] = [:]
