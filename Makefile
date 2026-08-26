@@ -29,7 +29,7 @@ CONFIG     ?= Release
 -include $(ROOT)/local.mk
 CODESIGN_ID ?= -
 
-.PHONY: all driver app install reinstall check-clients check-rate install-driver uninstall-driver uninstall check-protocol clean
+.PHONY: all driver app install reinstall check-clients check-rate test-driver install-driver uninstall-driver uninstall check-protocol clean
 
 all: driver app
 
@@ -38,7 +38,17 @@ driver:
 	cmake --build $(DRIVER_DIR)/build -j8
 	@codesign --verify --strict $(DRIVER_DIR)/build/FadedDriver.driver && echo "driver ok: $(DRIVER_DIR)/build/FadedDriver.driver"
 
-app: driver check-protocol
+# The ring stress harness runs the driver's producer and the reader's
+# resampler under ASan/UBSan, outside coreaudiod. It gates the app build:
+# a memory bug in that code wedges the machine's whole audio system, so it
+# must fail here, never on the speakers.
+test-driver:
+	@mkdir -p $(DRIVER_DIR)/test/build
+	clang++ -std=c++17 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
+	    -o $(DRIVER_DIR)/test/build/harness $(DRIVER_DIR)/test/harness.cpp
+	$(DRIVER_DIR)/test/build/harness
+
+app: driver check-protocol test-driver
 	cd $(APP_DIR) && xcodegen generate
 	cd $(APP_DIR) && xcodebuild -project Faded.xcodeproj -scheme Faded -configuration $(CONFIG) \
 	    -derivedDataPath build CODE_SIGN_IDENTITY="$(CODESIGN_ID)" build | grep -E "error|warning: .*Sources/Faded|BUILD" || true

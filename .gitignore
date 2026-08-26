@@ -2,6 +2,10 @@
 local.mk
 
 # build outputs
+driver/test/build/
+driver/test/harness
+driver/test/trace
+*.dSYM/
 build/
 driver/build/
 app/build/

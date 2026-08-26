@@ -48,6 +48,7 @@
 #include <unistd.h>
 
 #include "FadedShared.h"
+#include "FadedRingWriter.hpp"
 #include "FadedProtocol.h"
 
 namespace {
@@ -152,85 +153,20 @@ public:
 
     bool ok() const { return ring_ != nullptr; }
 
-    void setSampleRate(UInt32 rate)
-    {
-        if (ring_) std::atomic_store_explicit(&ring_->sampleRate, rate, std::memory_order_relaxed);
-    }
+    void setSampleRate(UInt32 rate) { writer_.setSampleRate(rate); }
 
-    void setRunning(bool running)
-    {
-        if (!ring_) return;
-        std::atomic_store_explicit(&ring_->outputRunning, running ? 1u : 0u, std::memory_order_relaxed);
-        if (running) {
-            // A fresh stream: tell the reader to resynchronise rather than try
-            // to play whatever stale frames are still sitting in the buffer.
-            std::atomic_fetch_add_explicit(&ring_->generation, 1u, std::memory_order_relaxed);
-        }
-    }
+    void setRunning(bool running) { writer_.setRunning(running); }
 
-    /// Real-time thread. Mixes one client's buffer into the ring at an
-    /// absolute frame position and publishes how far the device has got.
-    ///
-    /// Positions come from the HAL's own output sample time, so the ring is
-    /// addressed by the device's frame clock rather than by counting calls.
-    /// That matters: the HAL delivers one buffer *per client* per cycle, so
-    /// anything that advances the write index once per call runs at N times
-    /// real time with N apps playing — which sounds like a robot, because the
-    /// consumer is being handed twice the audio a second and spends its life
-    /// resynchronising. Addressing by position makes the number of clients
-    /// irrelevant: two apps writing the same cycle land on the same frames and
-    /// sum, exactly as they should.
+    /// Real-time thread. The logic lives in FadedRingWriter.hpp so the stress
+    /// harness in driver/test/ exercises exactly the code that ships.
     void mixInAt(uint64_t frameIndex, const Float32* frames, UInt32 frameCount)
     {
-        if (!ring_ || frameCount == 0) return;
-
-        // First buffer of a stream: anchor the ring to wherever the device's
-        // clock happens to be.
-        if (!anchored_) {
-            anchored_ = true;
-            highWater_ = frameIndex;
-            std::atomic_store_explicit(&ring_->writeIndex, frameIndex, std::memory_order_release);
-        }
-
-        const uint64_t end = frameIndex + frameCount;
-
-        // Frames past the high-water mark have never been written and still
-        // hold whatever the previous lap left behind, so clear them before
-        // summing into them.
-        if (end > highWater_) {
-            const uint64_t from = highWater_ > frameIndex ? highWater_ : frameIndex;
-            zeroRange(from, static_cast<UInt32>(end - from));
-            highWater_ = end;
-        }
-
-        for (UInt32 i = 0; i < frameCount; ++i) {
-            const uint32_t slot = static_cast<uint32_t>((frameIndex + i) & kFadedRingMask) * kFadedRingChannels;
-            ring_->samples[slot] += frames[i * kFadedRingChannels];
-            ring_->samples[slot + 1] += frames[i * kFadedRingChannels + 1];
-        }
-
-        // Release: the samples above are visible before the reader sees them.
-        std::atomic_store_explicit(&ring_->writeIndex, highWater_, std::memory_order_release);
+        writer_.mixInAt(frameIndex, frames, frameCount);
     }
 
-    void unanchor() { anchored_ = false; }
+    void unanchor() { writer_.unanchor(); }
 
     const char* status() const { return status_; }
-
-private:
-    void zeroRange(uint64_t index, UInt32 frameCount)
-    {
-        const uint32_t start = static_cast<uint32_t>(index & kFadedRingMask);
-        const uint32_t first = std::min(frameCount, kFadedRingFrames - start);
-        std::memset(&ring_->samples[start * kFadedRingChannels], 0,
-            sizeof(Float32) * first * kFadedRingChannels);
-        if (frameCount > first) {
-            std::memset(&ring_->samples[0], 0,
-                sizeof(Float32) * (frameCount - first) * kFadedRingChannels);
-        }
-    }
-
-public:
 
 private:
     SharedRing()
@@ -263,6 +199,7 @@ private:
         }
 
         ring_ = static_cast<FadedSharedRing*>(map);
+        writer_ = FadedRingWriter(ring_);
         std::memset(ring_, 0, sizeof(FadedSharedRing));
         ring_->capacityFrames = kFadedRingFrames;
         ring_->channels = kFadedRingChannels;
@@ -276,8 +213,7 @@ private:
     }
 
     FadedSharedRing* ring_ = nullptr;
-    uint64_t highWater_ = 0;
-    bool anchored_ = false;
+    FadedRingWriter writer_{nullptr};
     char status_[160] = "uninitialised";
 };
 

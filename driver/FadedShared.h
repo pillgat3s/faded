@@ -61,12 +61,22 @@ extern "C" {
 #define kFadedRingFrames (1u << 15) /* 32768 frames — ~680 ms at 48 kHz */
 #define kFadedRingMask (kFadedRingFrames - 1u)
 
-/// How far ahead of the reader the writer should be before playback starts.
-/// Absorbs one late buffer on either side without a dropout.
-#define kFadedRingPrimeFrames 1024u
+/// Baseline fill the reader holds between itself and the writer, in frames.
+///
+/// Both sides move in whole device cycles, so the measured fill is a
+/// stairstep: it sits constant while the clocks' phases align, then releases a
+/// whole cycle at once. The fill target must absorb that jump AND a full read
+/// on top — with the old target of 1024 the margin above "not enough for one
+/// read" was about zero, and every phase-wrap was a coin-flip click. 2048 is
+/// the floor; the reader adapts upward if it observes larger producer bursts
+/// (coreaudiod picks the device cycle, anywhere from 128 to 4096 frames).
+#define kFadedRingBaseTargetFrames 2048u
+/// Ceiling for the adaptive target — beyond this, latency is doing more harm
+/// than the burst it guards against.
+#define kFadedRingMaxTargetFrames 6144u
 /// If the reader is further behind than this, it jumps forward rather than
 /// letting latency stay high forever.
-#define kFadedRingMaxFrames 8192u
+#define kFadedRingMaxFrames 16384u
 
 typedef struct {
     uint32_t magic;    // kFadedShmMagic once initialised

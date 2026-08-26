@@ -15,10 +15,21 @@
 // A bigger buffer only changes how long you wait for the click.
 //
 // So the read rate is not fixed. A slow control loop watches the buffer's fill
-// level and nudges the rate by a fraction of a percent to hold it at target,
+// level and nudges the rate by a fraction of a percent to hold it at a target,
 // which cancels the drift rather than postponing it. The correction is far too
 // small and too slow to hear (it is bounded at 0.3%, and real drift needs about
-// a thirtieth of that), and it removes the underrun/resync clicks entirely.
+// a thirtieth of that).
+//
+// The target itself adapts. Both ends move in whole device cycles, so the
+// measured fill is a stairstep: constant while the two clocks' phases happen to
+// align, then a whole cycle at once when they wrap — and coreaudiod chooses
+// the producer's cycle size (anywhere from 128 to 4096 frames, by device and
+// clients). The target therefore tracks the largest burst actually observed,
+// plus one read and slack, so the stairstep's low edge can never reach the
+// underrun line. This is why the fill target is not a constant: with a fixed
+// target of two bursts, a device running larger cycles would click on every
+// phase wrap, and that is unpredictable-feeling in exactly the way an
+// intermittent fault is.
 //
 // Everything below `open`/`close` runs on the output render thread: no locks,
 // no allocation, no syscalls.
@@ -46,7 +57,16 @@ final class SharedRingReader: @unchecked Sendable {
 
     /// C macros import as Int32; the buffer maths wants Int.
     private let channels = Int(kFadedRingChannels)
-    private let targetFill = Double(kFadedRingPrimeFrames)
+
+    /// Adaptive fill target (frames). See the header comment for why this is
+    /// not a constant. Mirrored line for line in driver/test/harness.cpp —
+    /// change both together.
+    private var targetFill = Double(kFadedRingBaseTargetFrames)
+    /// Largest producer burst observed, with a slow decay so a one-off spike
+    /// does not pin the latency up forever.
+    private var maxBurst: Double = 0
+    private var lastAvailable: Double = -1
+    private var lastConsumed: Double = 0
 
     /// Hard ceiling on the correction. Real drift is ~100 ppm; 3000 ppm is
     /// thirty times the headroom needed and still well under the threshold
@@ -134,6 +154,8 @@ final class SharedRingReader: @unchecked Sendable {
 
     /// How full the buffer is sitting, in frames — should hover near the target.
     var fill: Double { averageFill }
+    /// Where the adaptive control loop is currently holding the fill.
+    var target: Double { targetFill }
 
     // MARK: Reading (render thread)
 
@@ -159,16 +181,38 @@ final class SharedRingReader: @unchecked Sendable {
         // buffer is stale. Jump forward rather than playing old audio or
         // sitting permanently late.
         if availableFrames > UInt64(kFadedRingMaxFrames) {
-            posInt = write &- UInt64(kFadedRingPrimeFrames)
+            posInt = write &- UInt64(targetFill)
             posFrac = 0
             available = targetFill
             averageFill = targetFill
+            lastAvailable = -1
             resyncs &+= 1
+        }
+
+        // Track the producer's burst size: between two reads, the fill changes
+        // by (produced - consumed), so produced = delta + what we consumed.
+        // This runs in the unprimed state too — sitting there watching the
+        // write index grow is exactly how the right target is known *before*
+        // the first frame ever plays; learning it only after starting means
+        // one guaranteed click on devices coreaudiod runs at large cycles.
+        if lastAvailable >= 0 {
+            let burst = available - lastAvailable + lastConsumed
+            if burst > maxBurst {
+                maxBurst = burst
+            } else {
+                maxBurst *= 0.9999   // halves in about a minute of callbacks
+            }
+            let needed = maxBurst + Double(frames) + 256
+            targetFill = min(max(Double(kFadedRingBaseTargetFrames), needed),
+                             Double(kFadedRingMaxTargetFrames))
         }
 
         if !primed {
             guard available >= targetFill else {
                 silence(dst, frames)
+                // Not consuming, but keep observing: burst learning stays live.
+                lastAvailable = available
+                lastConsumed = 0
                 return
             }
             primed = true
@@ -190,10 +234,17 @@ final class SharedRingReader: @unchecked Sendable {
             meterLock.withLock { $0 = (0, 0) }
             underruns &+= 1
             primed = false
+            // Keep the burst estimate across the stall; only the prime state
+            // resets. Relearning from scratch after every hiccup is how a
+            // fault stays intermittent forever.
+            lastAvailable = available
+            lastConsumed = 0
             return
         }
 
         FadedSharedRingResample(ring, &posInt, &posFrac, step, dst, frames)
+        lastConsumed = Double(frames) * step
+        lastAvailable = available - lastConsumed
         measure(dst, frames)
     }
 
@@ -222,5 +273,6 @@ final class SharedRingReader: @unchecked Sendable {
         posFrac = 0
         averageFill = 0
         primed = false
+        lastAvailable = -1
     }
 }

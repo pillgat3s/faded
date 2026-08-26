@@ -1022,8 +1022,8 @@ final class AudioRouter {
         s += "output has hw volume: \(target?.hasHardwareVolume ?? false) (false ⇒ Faded applies it in software)\n"
         let e = engine.stats
         s += "engine: rate=\(engine.sampleRate) under=\(e.underruns) resync=\(e.resyncs) over=\(e.overruns) producing=\(e.producing)\n"
-        s += String(format: "drift loop: fill=%.0f frames (target %d) correction=%+.0f ppm\n",
-                    e.fill, Int(kFadedRingPrimeFrames), e.driftPPM)
+        s += String(format: "drift loop: fill=%.0f frames (target %.0f) correction=%+.0f ppm\n",
+                    e.fill, engine.reader.target, e.driftPPM)
         for (k, v) in driver.stats().sorted(by: { $0.key < $1.key }) { s += "\(k)=\(v) " }
         if let err = lastError { s += "\nlast error: \(err)" }
         return s
