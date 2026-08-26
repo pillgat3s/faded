@@ -199,6 +199,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return sendResponse({ gain: value });
       }
 
+      // From a page (via its content script): the sender identifies the tab,
+      // so a page can only ever adjust itself. Runs the identical pipeline the
+      // popup slider does — storage, badge, broadcast to every frame.
+      case 'setGainFromPage': {
+        const tab = sender.tab;
+        if (!tab || tab.id === undefined) return sendResponse({});
+        const value = await setGain(tab.id, tab.url || '', message.gain);
+        return sendResponse({ gain: value });
+      }
+
       // Chrome's own per-tab mute — kept separate from gain so unmuting
       // restores the level you had rather than jumping to full.
       case 'setMuted': {

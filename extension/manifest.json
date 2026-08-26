@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Faded Tabs",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Per-tab volume for Chrome and Brave. Give each tab its own level; sites remember where you left them.",
   "permissions": [
     "storage",

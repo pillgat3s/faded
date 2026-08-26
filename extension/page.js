@@ -26,7 +26,14 @@
   'use strict';
 
   // Content scripts run once per frame, but be defensive about double-install.
+  // Version stamp, readable from any page console: distinguishes "the fix is
+  // loaded" from "an older build's hooks are still resident". The installed
+  // flag alone cannot tell those apart, because hooks survive extension
+  // reloads (the flag stops re-installation) — which is exactly how a stale
+  // build masquerades as a current one.
+  const VERSION = '0.2.0';
   const FLAG = '__fadedTabsInstalled';
+  window.__fadedTabsVersion = VERSION;   // updated even when hooks pre-exist
   if (window[FLAG]) return;
   window[FLAG] = true;
 

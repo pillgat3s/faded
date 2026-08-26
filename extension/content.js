@@ -30,7 +30,18 @@
   // page.js announces itself once its hooks are installed.
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
-    if (event.data && event.data.channel === CHANNEL_READY) pull();
+    if (!event.data) return;
+    if (event.data.channel === CHANNEL_READY) pull();
+    // Page-initiated volume request. A page can already set its own elements'
+    // volumes, so letting it ask for its own tab's gain grants nothing new —
+    // but it makes the whole popup pipeline drivable from a page console
+    // (popup UI itself cannot be automated), and it is the hook a native
+    // Faded.app bridge would use. Clamped in the background like any other.
+    if (event.data.channel === 'faded-tabs:request-set' && typeof event.data.gain === 'number') {
+      chrome.runtime
+        .sendMessage({ type: 'setGainFromPage', gain: event.data.gain })
+        .catch(() => {});
+    }
   });
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
