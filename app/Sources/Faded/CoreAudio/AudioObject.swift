@@ -60,13 +60,29 @@ enum AudioObject {
 
     // MARK: Plain-old-data values
 
-    static func get<T: BitwiseCopyable>(_ id: AudioObjectID, _ address: AudioObjectPropertyAddress, as _: T.Type = T.self) throws -> T {
+    /// `as:` is deliberately required. With it defaulted, Swift may bind T to
+    /// an Optional at call sites written `let x: UInt32 = (try? get(...)) ?? 0`
+    /// — a 5-byte type whose size this OS's HAL rejects outright ('!siz'), so
+    /// the read fails and the ?? swallows it. Which sites got miscompiled
+    /// varied between builds; device switching was deaf for days because of
+    /// one of them. An explicit scalar type at every call site ends the class.
+    static func get<T: BitwiseCopyable>(_ id: AudioObjectID, _ address: AudioObjectPropertyAddress, as _: T.Type) throws -> T {
         var addr = address
         var size = UInt32(MemoryLayout<T>.size)
         let ptr = UnsafeMutablePointer<T>.allocate(capacity: 1)
         defer { ptr.deallocate() }
         let status = AudioObjectGetPropertyData(id, &addr, 0, nil, &size, ptr)
         guard status == noErr else { throw AudioError.osStatus(status, "GetPropertyData \(fourCC(address.mSelector))") }
+        // If T inferred to something whose layout differs from the property's
+        // wire size (the classic trap: `let x: AudioDeviceID? = try? get(...)`
+        // binds T to Optional<AudioDeviceID>, 5 bytes, whose tag byte the HAL
+        // never writes), the value would be garbage with status 0. Refuse it
+        // loudly instead — this exact silent failure once made the app deaf to
+        // every device switch.
+        guard Int(size) == MemoryLayout<T>.size else {
+            throw AudioError.osStatus(kAudioHardwareBadPropertySizeError,
+                "GetPropertyData \(fourCC(address.mSelector)) wrote \(size)B into \(MemoryLayout<T>.size)B type \(T.self)")
+        }
         return ptr.pointee
     }
 
@@ -161,7 +177,8 @@ enum AudioSystem {
 
     static var defaultOutputDevice: AudioDeviceID? {
         get {
-            let id: AudioDeviceID? = try? AudioObject.get(object, .init(kAudioHardwarePropertyDefaultOutputDevice))
+            let id = try? AudioObject.get(object, .init(kAudioHardwarePropertyDefaultOutputDevice),
+                                          as: AudioDeviceID.self)
             return id.flatMap { $0 == kAudioObjectUnknown ? nil : $0 }
         }
     }
@@ -171,7 +188,8 @@ enum AudioSystem {
     }
 
     static var defaultInputDevice: AudioDeviceID? {
-        let id: AudioDeviceID? = try? AudioObject.get(object, .init(kAudioHardwarePropertyDefaultInputDevice))
+        let id = try? AudioObject.get(object, .init(kAudioHardwarePropertyDefaultInputDevice),
+                                      as: AudioDeviceID.self)
         return id.flatMap { $0 == kAudioObjectUnknown ? nil : $0 }
     }
 
@@ -180,7 +198,8 @@ enum AudioSystem {
     }
 
     static var defaultSystemOutputDevice: AudioDeviceID? {
-        let id: AudioDeviceID? = try? AudioObject.get(object, .init(kAudioHardwarePropertyDefaultSystemOutputDevice))
+        let id = try? AudioObject.get(object, .init(kAudioHardwarePropertyDefaultSystemOutputDevice),
+                                      as: AudioDeviceID.self)
         return id.flatMap { $0 == kAudioObjectUnknown ? nil : $0 }
     }
 

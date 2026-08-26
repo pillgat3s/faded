@@ -74,14 +74,14 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
         self.id = id
         self.uid = uid
         name = AudioObject.getString(id, .init(kAudioObjectPropertyName)) ?? uid
-        let rawTransport: UInt32 = (try? AudioObject.get(id, .init(kAudioDevicePropertyTransportType))) ?? 0
+        let rawTransport = (try? AudioObject.get(id, .init(kAudioDevicePropertyTransportType), as: UInt32.self)) ?? 0
         transport = Transport(raw: rawTransport)
         hasOutput = Self.channelCount(id, scope: kAudioObjectPropertyScopeOutput) > 0
         hasInput = Self.channelCount(id, scope: kAudioObjectPropertyScopeInput) > 0
         hasHardwareVolume = Self.volumeAddress(for: id) != nil
         hasHardwareMute = Self.muteAddress(for: id) != nil
         hasInputVolume = Self.volumeAddress(for: id, scope: kAudioObjectPropertyScopeInput) != nil
-        let hidden: UInt32 = (try? AudioObject.get(id, .init(kAudioDevicePropertyIsHidden))) ?? 0
+        let hidden = (try? AudioObject.get(id, .init(kAudioDevicePropertyIsHidden), as: UInt32.self)) ?? 0
         isHidden = hidden != 0
     }
 
@@ -122,7 +122,7 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
     var isFadedDevice: Bool { uid == FadedProtocol.outputDeviceUID }
 
     var isAlive: Bool {
-        let alive: UInt32 = (try? AudioObject.get(id, .init(kAudioDevicePropertyDeviceIsAlive))) ?? 0
+        let alive = (try? AudioObject.get(id, .init(kAudioDevicePropertyDeviceIsAlive), as: UInt32.self)) ?? 0
         return alive != 0
     }
 
@@ -181,7 +181,7 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
 
     var isInputMuted: Bool? {
         guard let addr = Self.muteAddress(for: id, scope: kAudioObjectPropertyScopeInput) else { return nil }
-        let v: UInt32? = try? AudioObject.get(id, addr)
+        let v = try? AudioObject.get(id, addr, as: UInt32.self)
         return v.map { $0 != 0 }
     }
 
@@ -216,7 +216,7 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
 
     var isMuted: Bool? {
         guard let addr = Self.muteAddress(for: id) else { return nil }
-        let v: UInt32? = try? AudioObject.get(id, addr)
+        let v = try? AudioObject.get(id, addr, as: UInt32.self)
         return v.map { $0 != 0 }
     }
 

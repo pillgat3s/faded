@@ -26,6 +26,26 @@ import Foundation
 import Observation
 import os
 
+/// Appends one timestamped line to ~/Library/Application Support/Faded/trace.log.
+/// os_log has proven unreliable as a witness on this system (whole-process
+/// silence in `log show`), and a debugger cannot watch a menu bar app react to
+/// device hot-plugs in real time. A plain file can. Cheap enough to leave on.
+func trace(_ message: String) {
+    let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Faded", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let url = dir.appendingPathComponent("trace.log")
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    let line = "\(stamp) \(message)\n"
+    if let handle = try? FileHandle(forWritingTo: url) {
+        handle.seekToEndOfFile()
+        handle.write(Data(line.utf8))
+        try? handle.close()
+    } else {
+        try? Data(line.utf8).write(to: url)
+    }
+}
+
 @MainActor
 @Observable
 final class AudioRouter {
@@ -167,6 +187,9 @@ final class AudioRouter {
     private var targetControlListeners: [ListenerToken] = []
     private var targetRateListener: ListenerToken?
     private var fadedRateListener: ListenerToken?
+    private var fadedRunningListener: ListenerToken?
+    private var idlePauseTimer: Timer?
+    private var reconcileTimer: Timer?
     private var inputControlListeners: [ListenerToken] = []
     private var meterTimer: Timer?
     private var healthTimer: Timer?
@@ -263,6 +286,7 @@ final class AudioRouter {
         refreshDevices()
         if enabled { engage() }
         refreshApps()
+        startWatchdog()
     }
 
     // MARK: Browser tabs (via the extension bridge)
@@ -324,8 +348,10 @@ final class AudioRouter {
         pushAllAppGains()
         applyVolumeForTarget()
         isEngaged = true
+        trace("engaged → \(initialTarget.name)")
+        installIdleRelease()
         refreshApps()
-        Self.log.info("engaged → \(initialTarget.name)")
+        Self.log.notice("engaged → \(initialTarget.name)")
     }
 
     func disengage(restoreDefault: Bool) {
@@ -342,9 +368,12 @@ final class AudioRouter {
         }
         outputLevel = (0, 0)
         isEngaged = false
+        fadedRunningListener = nil
+        idlePauseTimer?.invalidate()
+        idlePauseTimer = nil
         // Nothing is being routed any more; stop impersonating a real device.
         driver.setDisplayName(FadedProtocol.outputDeviceName)
-        Self.log.info("disengaged")
+        Self.log.notice("disengaged")
     }
 
     /// Call from applicationWillTerminate.
@@ -379,6 +408,44 @@ final class AudioRouter {
         let fill = Int(e.fill)
         let ppm = Int(e.driftPPM)
         Self.log.notice("audio dropout: \(newUnder) underrun(s), \(newResync) resync(s) — fill \(fill) frames, drift correction \(ppm) ppm")
+    }
+
+    // MARK: Idle release
+
+    /// The HAL flips kAudioDevicePropertyDeviceIsRunningSomewhere on the Faded
+    /// device the moment any app starts or stops doing I/O to it. Playing →
+    /// output opens immediately (the ring buffers the first frames, so nothing
+    /// is lost). Silent for ten seconds → the output stream is released, which
+    /// lets devices sleep and — the part that matters for AirPods — lets
+    /// Apple's automatic switching hand them back to the iPhone, which it will
+    /// never do while the Mac holds a stream open.
+    private func installIdleRelease() {
+        guard let faded = driver.outputDevice else { return }
+        fadedRunningListener = AudioObject.listen(faded.id,
+            .init(kAudioDevicePropertyDeviceIsRunningSomewhere)) { [weak self] in
+            Task { @MainActor in self?.producerRunningChanged() }
+        }
+        producerRunningChanged()
+    }
+
+    private func producerRunningChanged() {
+        guard isEngaged, let faded = driver.outputDevice else { return }
+        let running = (try? AudioObject.get(faded.id,
+            .init(kAudioDevicePropertyDeviceIsRunningSomewhere), as: UInt32.self)) ?? 0
+        trace("producerRunning=\(running)")
+        if running != 0 {
+            idlePauseTimer?.invalidate()
+            idlePauseTimer = nil
+            engine.resumeOutput()
+        } else if idlePauseTimer == nil {
+            idlePauseTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: false) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, self.isEngaged else { return }
+                    trace("idle 10 s — pausing output")
+                    self.engine.pauseOutput()
+                }
+            }
+        }
     }
 
     // MARK: Output selection
@@ -424,7 +491,7 @@ final class AudioRouter {
         installTargetListeners()
         applyVolumeForTarget()
         driver.setDisplayName(device.name)
-        Self.log.info("target → \(device.name)")
+        trace("retarget complete → \(device.name); displayName sent")
     }
 
     private func startEngine(for device: AudioDevice) throws {
@@ -519,20 +586,50 @@ final class AudioRouter {
     /// made Faded miss AirPlay entirely; instead the device gets a few hundred
     /// milliseconds to finish appearing before we give up on it.
     private func defaultOutputChanged() {
-        guard !settingDefault, let faded = driver.outputDevice else { return }
-        guard let current = AudioSystem.defaultOutputDevice, current != faded.id else { return }
-        adopt(current, attempt: 0)
+        guard !settingDefault else { return }
+        resolveDefaultChange(attempt: 0)
+    }
+
+    /// Reading kAudioHardwarePropertyDefaultOutputDevice from inside the HAL's
+    /// own change callback frequently returns kAudioObjectUnknown — the HAL is
+    /// mid-transaction. Trusting that read made the app deaf to device
+    /// switches whenever the timing was wrong (which for AirPods was nearly
+    /// always). So the read is retried on a short timer until the HAL answers.
+    private func resolveDefaultChange(attempt: Int) {
+        guard let faded = driver.outputDevice else { return }
+        let current = AudioSystem.defaultOutputDevice
+        trace("resolveDefault attempt=\(attempt) current=\(current ?? 0)")
+        if let current, current != 0 {
+            if current != faded.id { adopt(current, attempt: 0) }
+            return
+        }
+        guard attempt < 20 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            Task { @MainActor in self?.resolveDefaultChange(attempt: attempt + 1) }
+        }
     }
 
     /// Adopt `deviceID` if we can play to it, retrying briefly while it settles.
     private func adopt(_ deviceID: AudioDeviceID, attempt: Int) {
+        trace("adopt(\(deviceID), attempt \(attempt))")
         guard let faded = driver.outputDevice else { return }
-        // Something else moved the default again while we were waiting.
-        guard AudioSystem.defaultOutputDevice == deviceID else { return }
+        // The default moved again mid-retry (AirPods connects flip it more
+        // than once). Chase the new one rather than silently giving up.
+        if let current = AudioSystem.defaultOutputDevice, current != deviceID {
+            if current != faded.id { adopt(current, attempt: 0) }
+            return
+        }
 
         let device = AudioDevice(id: deviceID)
         let adoptable = device.map { $0.hasOutput && !$0.isFadedDevice && $0.isAlive } ?? false
 
+        if let d = device {
+            trace("adopt: adoptable=\(adoptable) name=\(d.name) hasOutput=\(d.hasOutput) alive=\(d.isAlive) isFaded=\(d.isFadedDevice) engaged=\(isEngaged)")
+        } else {
+            trace("adopt: device snapshot nil for \(deviceID)")
+        }
+        adoptRetry?.cancel()
+        adoptRetry = nil
         if adoptable, let device {
             if isEngaged {
                 Self.log.info("system default moved to \(device.name) — following")
@@ -547,24 +644,51 @@ final class AudioRouter {
             return
         }
 
-        if attempt < 6 {
+        // Bluetooth audio takes seconds to bring its streams up, not the few
+        // hundred milliseconds AirPlay needs — a window that ends before the
+        // device is ready leaves Faded stood aside with no event to ever wake
+        // it (the default never changes again). Ten seconds covers AirPods
+        // reconnecting from an iPhone handoff.
+        if attempt < 40 {
             adoptRetry?.cancel()
             let work = DispatchWorkItem { [weak self] in
                 Task { @MainActor in self?.adopt(deviceID, attempt: attempt + 1) }
             }
             adoptRetry = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
             return
         }
 
         // Genuinely cannot follow it. Let macOS route natively rather than
         // fighting for the default and yanking playback away from the user.
         guard isEngaged else { return }
-        Self.log.info("default moved somewhere Faded can't follow — stepping aside")
+        Self.log.notice("default moved somewhere Faded can't follow — stepping aside")
         steppedAside = true
         disengage(restoreDefault: false)
         target = device
         readVolumeFromTargetDirectly()
+    }
+
+    /// Watchdog for every way routing can silently break: a change callback
+    /// whose read failed, a device that became adoptable after the retry
+    /// window, a stepped-aside AirPlay session ending, a stolen default. Two
+    /// cheap property reads every three seconds; acts only when the default
+    /// is a real device that is not Faded.
+    private func startWatchdog() {
+        reconcileTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.watchdogTick() }
+        }
+    }
+
+    private func watchdogTick() {
+        guard enabled, driver.isReady, !settingDefault, adoptRetry == nil,
+              let faded = driver.outputDevice,
+              let current = AudioSystem.defaultOutputDevice, current != 0,
+              current != faded.id
+        else { return }
+        trace("watchdog: default is \(current), not faded — adopting")
+        steppedAside = false
+        adopt(current, attempt: 0)
     }
 
     private func devicesChanged() {

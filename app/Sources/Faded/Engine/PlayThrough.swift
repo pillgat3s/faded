@@ -23,6 +23,8 @@ final class PlayThrough: @unchecked Sendable {
     let reader = SharedRingReader()
 
     private(set) var isRunning = false
+    /// Output unit released while nothing is playing — see pauseOutput().
+    private(set) var outputPaused = false
     private(set) var sampleRate: Double = 0
     private(set) var outputDeviceID: AudioDeviceID = kAudioObjectUnknown
 
@@ -70,9 +72,42 @@ final class PlayThrough: @unchecked Sendable {
         isRunning = false
     }
 
+    /// Stops just the output unit, keeping the ring mapped and the engine
+    /// engaged. Two reasons to do this while idle: an open stream keeps the
+    /// device awake (battery), and on AirPods it tells Apple's automatic
+    /// switching that the Mac is actively using them — which silently breaks
+    /// switching back to the iPhone. The ring keeps absorbing the producer, so
+    /// resume loses nothing.
+    func pauseOutput() {
+        guard isRunning, !outputPaused else { return }
+        if let u = outputUnit {
+            AudioOutputUnitStop(u)
+            AudioUnitUninitialize(u)
+            AudioComponentInstanceDispose(u)
+        }
+        outputUnit = nil
+        outputPaused = true
+        Self.log.info("output paused (idle)")
+    }
+
+    func resumeOutput() {
+        guard isRunning, outputPaused else { return }
+        outputPaused = false
+        do {
+            try startOutput(device: outputDeviceID, format: Self.clientFormat(rate: sampleRate))
+            Self.log.info("output resumed")
+        } catch {
+            Self.log.error("resume failed: \(String(describing: error))")
+        }
+    }
+
     /// Swap the destination without disturbing the producer side.
     func retarget(output: AudioDeviceID) throws {
         guard isRunning else { return }
+        if outputPaused {
+            outputDeviceID = output   // unit is created on resume
+            return
+        }
         if let u = outputUnit {
             AudioOutputUnitStop(u)
             AudioUnitUninitialize(u)
