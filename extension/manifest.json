@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Faded Tabs",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Per-tab volume for Chrome and Brave. Give each tab its own level; sites remember where you left them.",
   "permissions": [
+    "nativeMessaging",
+    "scripting",
     "storage",
-    "tabs",
-    "scripting"
+    "tabs"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -52,5 +53,6 @@
       "48": "icons/faded_48.png",
       "128": "icons/faded_128.png"
     }
-  }
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAraCIUHW/Z9Jz/LlKtELs3bkBNwG5PmbaIn0QVIgznxRVTiXSCGPcAGepS3GlmuCUxeh9Q2M3CD84GW6mcHsmWugc77dWfAlSHpMiIczoddtnxElwO1J3w4JDLqDOpyyQqztSKLixsQoFK2J3isHmaVi1asHhw3PfVm9QsYCRe8PGgiD8/BbLwpHTtV0A9nEdckM5bM5PuQO2RjdgMydYm73s7MU8WCIK3ODWNKO2etUqAhl0LlpJ1HEuVlzmrDnoOGu/C3hZxNHVLm6Y8jsACPOSDaKlNgYD0kdqbspZzce3XvY2dPY98vsmWqVmYh29nVvrLu3D8qtxxQZtqNN4DQIDAQAB"
 }

@@ -43,6 +43,9 @@ final class AudioRouter {
     private(set) var inputVolume: Float = 1
     private(set) var inputMuted = false
     private(set) var apps: [AppEntry] = []
+    /// Chrome tabs, live from the Faded Tabs extension over the native bridge.
+    private(set) var browserTabs: [BrowserTab] = []
+    private(set) var browserBridgeConnected = false
     private(set) var isEngaged = false
     private(set) var lastError: String?
     /// True when macOS is routing output somewhere Faded cannot follow (an
@@ -152,6 +155,7 @@ final class AudioRouter {
     // MARK: Internals
 
     let driver = DriverLink()
+    let bridge = BrowserBridge()
     private let engine = PlayThrough()
     private let inputMeter = InputMeter()
     private let defaults = UserDefaults.standard
@@ -245,9 +249,36 @@ final class AudioRouter {
             Task { @MainActor in self?.stopMetering() }
         }
 
+        bridge.onTabs = { [weak self] tabs in
+            // Audible first, then anything holding a non-default setting.
+            self?.browserTabs = tabs.sorted {
+                ($0.audible ? 0 : 1, $0.title) < ($1.audible ? 0 : 1, $1.title)
+            }
+        }
+        bridge.onConnectionChanged = { [weak self] connected in
+            self?.browserBridgeConnected = connected
+        }
+        bridge.start()
+
         refreshDevices()
         if enabled { engage() }
         refreshApps()
+    }
+
+    // MARK: Browser tabs (via the extension bridge)
+
+    func setTabGain(_ tabID: Int, _ gain: Float) {
+        bridge.setTabGain(tabID, gain)
+        if let i = browserTabs.firstIndex(where: { $0.id == tabID }) {
+            browserTabs[i].gain = min(max(gain, 0), 1)   // optimistic; snapshot follows
+        }
+    }
+
+    func setTabMuted(_ tabID: Int, _ muted: Bool) {
+        bridge.setTabMuted(tabID, muted)
+        if let i = browserTabs.firstIndex(where: { $0.id == tabID }) {
+            browserTabs[i].muted = muted
+        }
     }
 
     // MARK: Engage / disengage
@@ -318,6 +349,7 @@ final class AudioRouter {
 
     /// Call from applicationWillTerminate.
     func shutdown() {
+        bridge.stop()
         inputMeter.stop()
         disengage(restoreDefault: true)
     }

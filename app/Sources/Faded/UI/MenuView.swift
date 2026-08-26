@@ -264,6 +264,16 @@ struct MenuView: View {
             ForEach(visibleAppRows) { app in
                 appRow(app)
             }
+            if appsExpanded, !router.browserTabs.isEmpty {
+                Text("Chrome tabs")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 4)
+                ForEach(router.browserTabs) { tab in
+                    tabRow(tab)
+                }
+            }
             // Only say nothing is playing when nothing actually is. A collapsed
             // section with unstarred apps behind it has no rows to show, but
             // the header's count is already telling the truth.
@@ -336,6 +346,39 @@ struct MenuView: View {
             Divider()
             Text(app.id)
         }
+    }
+
+    /// One Chrome tab, driven through the extension bridge. Shaped like an app
+    /// row, indented, no star (tabs are ephemeral) and no meter (levels live in
+    /// the page; the extension does not stream them).
+    private func tabRow(_ tab: BrowserTab) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: tab.audible ? "speaker.wave.2" : "globe")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .frame(width: 13)
+            Text(tab.title)
+                .font(.system(size: 12))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(width: 96, alignment: .leading)
+            FadedSlider(value: Binding(get: { tab.muted ? 0 : tab.gain },
+                                       set: { router.setTabGain(tab.id, $0) }),
+                        trackHeight: 4, knobDiameter: 12)
+            Button {
+                router.setTabMuted(tab.id, !tab.muted)
+            } label: {
+                Image(systemName: tab.muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(tab.muted ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary))
+                    .frame(width: 14)
+            }
+            .buttonStyle(.plain)
+            .help(tab.muted ? "Unmute tab" : "Mute tab")
+        }
+        .padding(.leading, 30)
+        .padding(.trailing, 16)
+        .padding(.vertical, 2)
     }
 
     // MARK: Driver card

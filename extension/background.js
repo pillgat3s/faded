@@ -13,6 +13,7 @@
 // scope; every handler reads storage. It's a few hundred bytes.
 
 const DEFAULT_GAIN = 1;
+const NATIVE_HOST = 'com.andri.faded';
 
 // ---------------------------------------------------------------------------
 // Storage
@@ -89,8 +90,69 @@ async function setGain(tabId, url, gain) {
   await setTabGain(tabId, value);
   await setSiteGain(originOf(url), value);
   await applyToTab(tabId, value);
+  snapshotAndSend();
   return value;
 }
+
+// ---------------------------------------------------------------------------
+// Native bridge to Faded.app
+//
+// Chrome spawns the faded-native-host relay when this port opens; the relay
+// dials Faded.app's unix socket and shuttles JSON both ways. The port doubles
+// as the MV3 keep-alive: the app pings every 20 s, and traffic on a native
+// port resets the service worker's idle timer.
+// ---------------------------------------------------------------------------
+
+let nativePort = null;
+
+function snapshotAndSend() {
+  buildTabList()
+    .then(({ tabs }) => {
+      nativePort?.postMessage({
+        type: 'tabs',
+        tabs: tabs
+          .filter((t) => t.adjustable && (t.audible || t.gain !== DEFAULT_GAIN || t.muted))
+          .map(({ id, title, gain, audible, muted }) => ({ id, title, gain, audible, muted })),
+      });
+    })
+    .catch(() => {});
+}
+
+function connectNativeBridge() {
+  if (nativePort) return;
+  try {
+    nativePort = chrome.runtime.connectNative(NATIVE_HOST);
+  } catch (_) {
+    nativePort = null;
+    return; // host manifest not installed (Faded.app has never run) — retry later
+  }
+  nativePort.onMessage.addListener(async (message) => {
+    switch (message?.type) {
+      case 'ping':
+      case 'bridge':
+        snapshotAndSend();
+        break;
+      case 'setGain': {
+        const tab = await chrome.tabs.get(message.tabId).catch(() => null);
+        if (tab) await setGain(tab.id, tab.url || '', message.gain);
+        snapshotAndSend();
+        break;
+      }
+      case 'setMuted':
+        await chrome.tabs.update(message.tabId, { muted: !!message.muted }).catch(() => {});
+        snapshotAndSend();
+        break;
+    }
+  });
+  nativePort.onDisconnect.addListener(() => {
+    nativePort = null;
+    setTimeout(connectNativeBridge, 15_000);
+  });
+}
+
+chrome.runtime.onStartup.addListener(connectNativeBridge);
+chrome.runtime.onInstalled.addListener(connectNativeBridge);
+connectNativeBridge();
 
 // ---------------------------------------------------------------------------
 // Injecting into tabs that were already open
@@ -146,6 +208,34 @@ async function isHooked(tabId) {
     if (attempt === 0) await new Promise((r) => setTimeout(r, 60));
   }
   return false;
+}
+
+/** The current tab plus everything audible, with per-tab state resolved.
+ * Shared by the popup and the Faded.app bridge; `probeHooks` costs a message
+ * round-trip per tab and only the popup needs it. */
+async function buildTabList(probeHooks = false) {
+  const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  const audible = await chrome.tabs.query({ audible: true });
+  const overrides = await tabGains();
+
+  const byId = new Map();
+  for (const tab of [...(active ? [active] : []), ...audible]) {
+    if (!tab || tab.id === undefined || byId.has(tab.id)) continue;
+    byId.set(tab.id, {
+      id: tab.id,
+      title: tab.title || tab.url || 'Tab',
+      favIconUrl: tab.favIconUrl || '',
+      url: tab.url || '',
+      audible: !!tab.audible,
+      muted: !!tab.mutedInfo?.muted,
+      active: tab.id === active?.id,
+      gain: await gainFor(tab.id, tab.url || ''),
+      adjustable: !!originOf(tab.url || ''),
+      hooked: probeHooks && originOf(tab.url || '') ? await isHooked(tab.id) : true,
+    });
+  }
+  const list = [...byId.values()].sort((a, b) => Number(b.active) - Number(a.active));
+  return { tabs: list, hasOverrides: Object.keys(overrides).length > 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +324,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // A tab that finishes loading needs its level re-applied: the content script
 // asks on its own, but this also covers same-document navigations.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.audible !== undefined || changeInfo.mutedInfo !== undefined) snapshotAndSend();
+});
+
+chrome.tabs.onRemoved.addListener(() => snapshotAndSend());
+
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete' && changeInfo.url === undefined) return;
   const gain = await gainFor(tabId, tab.url || '');

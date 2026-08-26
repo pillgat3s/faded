@@ -29,7 +29,7 @@ CONFIG     ?= Release
 -include $(ROOT)/local.mk
 CODESIGN_ID ?= -
 
-.PHONY: all driver app install reinstall check-clients check-rate test-driver install-driver uninstall-driver uninstall check-protocol clean
+.PHONY: all driver app install reinstall check-clients check-rate test-driver bridge-helper install-driver uninstall-driver uninstall check-protocol clean
 
 all: driver app
 
@@ -48,14 +48,25 @@ test-driver:
 	    -o $(DRIVER_DIR)/test/build/harness $(DRIVER_DIR)/test/harness.cpp
 	$(DRIVER_DIR)/test/build/harness
 
-app: driver check-protocol test-driver
+# The native-messaging relay Chrome spawns to reach the app. Single Swift
+# file, no project — built straight into the bundle's Helpers directory, after
+# which the bundle must be re-signed (adding a file breaks the seal).
+bridge-helper:
+	@mkdir -p $(ROOT)/bridge/build
+	swiftc -O -o $(ROOT)/bridge/build/faded-native-host $(ROOT)/bridge/faded-native-host.swift
+	codesign --force --timestamp=none -s "$(CODESIGN_ID)" $(ROOT)/bridge/build/faded-native-host
+
+app: driver check-protocol test-driver bridge-helper
 	cd $(APP_DIR) && xcodegen generate
 	cd $(APP_DIR) && xcodebuild -project Faded.xcodeproj -scheme Faded -configuration $(CONFIG) \
 	    -derivedDataPath build CODE_SIGN_IDENTITY="$(CODESIGN_ID)" build | grep -E "error|warning: .*Sources/Faded|BUILD" || true
 	@mkdir -p $(OUT)
 	@rm -rf $(OUT)/Faded.app
 	@cp -R $(APP_DIR)/build/Build/Products/$(CONFIG)/Faded.app $(OUT)/
-	@echo "app ok: $(OUT)/Faded.app"
+	@mkdir -p $(OUT)/Faded.app/Contents/Helpers
+	cp $(ROOT)/bridge/build/faded-native-host $(OUT)/Faded.app/Contents/Helpers/
+	codesign --force --timestamp=none -s "$(CODESIGN_ID)" $(OUT)/Faded.app
+	@echo "app ok: $(OUT)/Faded.app (bridge helper embedded)"
 
 install: app
 	@rm -rf /Applications/Faded.app
@@ -105,4 +116,4 @@ check-protocol:
 	@$(ROOT)/scripts/check-protocol.sh
 
 clean:
-	rm -rf $(DRIVER_DIR)/build $(APP_DIR)/build $(APP_DIR)/Faded.xcodeproj $(OUT)
+	rm -rf $(DRIVER_DIR)/build $(APP_DIR)/build $(APP_DIR)/Faded.xcodeproj $(ROOT)/bridge/build $(OUT)
