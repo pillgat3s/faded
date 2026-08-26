@@ -12,6 +12,10 @@ struct MenuView: View {
     @Bindable var router: AudioRouter
     /// DEBUG render mode starts with the Apps list open (see `--render-menu`).
     var previewExpandApps = false
+    // Collapsed sections show only the selected device — the useful summary —
+    // and remember their state across popover openings.
+    @AppStorage("menuOutputExpanded") private var outputExpanded = true
+    @AppStorage("menuInputExpanded") private var inputExpanded = true
     @State private var showingHidden = false
     @State private var appsExpanded = false
     @State private var installError: String?
@@ -101,26 +105,31 @@ struct MenuView: View {
 
     private var outputSection: some View {
         VStack(alignment: .leading, spacing: 1) {
-            sectionTitle("Output")
-            ForEach(router.visibleOutputs) { dev in
-                deviceRow(dev, selected: dev.uid == router.target?.uid, kind: .output)
-            }
-            if showingHidden {
-                ForEach(router.hiddenOutputs) { dev in
-                    deviceRow(dev, selected: dev.uid == router.target?.uid, kind: .output, dimmed: true)
+            sectionToggle("Output", isExpanded: $outputExpanded)
+            if outputExpanded {
+                ForEach(router.visibleOutputs) { dev in
+                    deviceRow(dev, selected: dev.uid == router.target?.uid, kind: .output)
                 }
+                if showingHidden {
+                    ForEach(router.hiddenOutputs) { dev in
+                        deviceRow(dev, selected: dev.uid == router.target?.uid, kind: .output, dimmed: true)
+                    }
+                }
+                if router.visibleOutputs.isEmpty, !showingHidden {
+                    Text("No output devices").font(.system(size: 12)).foregroundStyle(.secondary)
+                        .padding(.horizontal, 16).padding(.vertical, 4)
+                }
+                if router.hasHiddenDevices { showMoreRow }
+                Text("AirPlay speakers: choose them in Control Center.")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 3)
+            } else if let t = router.target,
+                      let dev = router.allOutputs.first(where: { $0.uid == t.uid }) {
+                deviceRow(dev, selected: true, kind: .output)
             }
-            if router.visibleOutputs.isEmpty, !showingHidden {
-                Text("No output devices").font(.system(size: 12)).foregroundStyle(.secondary)
-                    .padding(.horizontal, 16).padding(.vertical, 4)
-            }
-            if router.hasHiddenDevices { showMoreRow }
-            Text("AirPlay speakers: choose them in Control Center.")
-                .font(.system(size: 10.5))
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 16)
-                .padding(.top, 3)
         }
         .padding(.bottom, 8)
     }
@@ -165,20 +174,47 @@ struct MenuView: View {
 
     private var inputSection: some View {
         VStack(alignment: .leading, spacing: 1) {
-            sectionTitle("Input")
-            ForEach(router.visibleInputs) { dev in
-                deviceRow(dev, selected: dev.uid == router.selectedInput?.uid, kind: .input)
-            }
-            if showingHidden {
-                ForEach(router.hiddenInputs) { dev in
-                    deviceRow(dev, selected: dev.uid == router.selectedInput?.uid, kind: .input, dimmed: true)
+            sectionToggle("Input", isExpanded: $inputExpanded)
+            if inputExpanded {
+                ForEach(router.visibleInputs) { dev in
+                    deviceRow(dev, selected: dev.uid == router.selectedInput?.uid, kind: .input)
                 }
+                if showingHidden {
+                    ForEach(router.hiddenInputs) { dev in
+                        deviceRow(dev, selected: dev.uid == router.selectedInput?.uid, kind: .input, dimmed: true)
+                    }
+                }
+            } else if let i = router.selectedInput,
+                      let dev = router.allInputs.first(where: { $0.uid == i.uid }) {
+                deviceRow(dev, selected: true, kind: .input)
             }
         }
         .padding(.bottom, 8)
     }
 
-    // MARK: Device row
+    /// Section header that collapses its list, shaped exactly like the Apps
+    /// toggle so the three sections read as one family.
+    private func sectionToggle(_ title: String, isExpanded: Binding<Bool>) -> some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.15)) { isExpanded.wrappedValue.toggle() }
+        } label: {
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+        }
+        .buttonStyle(MenuRowStyle())
+        .padding(.horizontal, 8)
+    }
+
+    // MARK: Device row    // MARK: Device row
 
     private enum DeviceKind { case output, input }
 
