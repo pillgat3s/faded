@@ -28,6 +28,8 @@
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Faded uses an administrator prompt to install its audio driver.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Faded lists your paired headphones and connects them when you pick one — the same as choosing them in Control Center.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string></string>
 	<key>NSMicrophoneUsageDescription</key>

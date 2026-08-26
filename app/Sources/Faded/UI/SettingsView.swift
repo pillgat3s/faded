@@ -61,6 +61,9 @@ private struct GeneralSettings: View {
                         }
                     }
                 Toggle("Route audio through Faded", isOn: $router.enabled)
+                Toggle("Also route Bluetooth headphones through Faded", isOn: $router.routeBluetoothThroughFaded)
+                Text("Off keeps AirPods fully native: automatic Mac-iPhone switching, ear detection and the volume keys all work exactly as without Faded — only per-app volume pauses while they hold the output. On gives per-app volume on Bluetooth too, at the cost of that native behaviour.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Text(router.enabled
                      ? "Volume keys work on every device, and each app gets its own level."
                      : "Faded is passive: macOS handles audio exactly as it would without it.")

@@ -119,6 +119,9 @@ struct MenuView: View {
                     Text("No output devices").font(.system(size: 12)).foregroundStyle(.secondary)
                         .padding(.horizontal, 16).padding(.vertical, 4)
                 }
+                ForEach(router.offlineBluetooth) { bt in
+                    offlineBluetoothRow(bt)
+                }
                 if router.hasHiddenDevices { showMoreRow }
                 Text("AirPlay speakers: choose them in Control Center.")
                     .font(.system(size: 10.5))
@@ -134,13 +137,46 @@ struct MenuView: View {
         .padding(.bottom, 8)
     }
 
+    /// A paired headset that is not audio-connected (with the iPhone, or in
+    /// its case). Clicking connects it, exactly like Control Center would.
+    private func offlineBluetoothRow(_ bt: PairedBluetoothDevice) -> some View {
+        Button { router.connectBluetooth(bt) } label: {
+            HStack(spacing: 10) {
+                Color.clear.frame(width: meterWidth)
+                Group {
+                    if router.connectingBluetooth == bt.id {
+                        ProgressView().controlSize(.small).scaleEffect(0.7)
+                    } else {
+                        Image(systemName: bt.name.localizedCaseInsensitiveContains("airpods max")
+                                          ? "airpods.max" : bt.name.localizedCaseInsensitiveContains("airpods")
+                                          ? "airpods.pro" : "headphones")
+                            .font(.system(size: 13))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(width: 26)
+                Text(bt.name)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
+            }
+            .padding(.trailing, 8)
+        }
+        .buttonStyle(MenuRowStyle())
+        .padding(.horizontal, 8)
+        .disabled(router.connectingBluetooth != nil)
+    }
+
     /// Shown when macOS has routed output somewhere Faded cannot follow.
     private var steppedAsideBanner: some View {
         HStack(spacing: 7) {
             Image(systemName: "airplayaudio")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
-            Text("macOS is routing audio directly\(router.target.map { " to \($0.name)" } ?? ""). Faded is standing by.")
+            Text(router.target?.transport == .bluetooth
+                 ? "\(router.target?.name ?? "Your headphones") are handled natively — auto-switching with your iPhone and ear detection work as usual. Per-app volume resumes on other devices."
+                 : "macOS is routing audio directly\(router.target.map { " to \($0.name)" } ?? ""). Faded is standing by.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

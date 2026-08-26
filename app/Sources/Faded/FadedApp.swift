@@ -48,6 +48,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         installStatusItemContextMenu()
+        // `Faded --bt-connect <mac>` exercises the Bluetooth connect path
+        // headless and reports to the trace file. Release builds too: the
+        // Bluetooth TCC grant belongs to the installed app, so the probe must
+        // run as it.
+        if let i = CommandLine.arguments.firstIndex(of: "--bt-connect"),
+           i + 1 < CommandLine.arguments.count {
+            let mac = CommandLine.arguments[i + 1]
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(1))
+                self.router.connectBluetooth(PairedBluetoothDevice(id: mac, name: mac))
+                try? await Task.sleep(for: .seconds(40))
+                self.router.shutdown()
+                NSApp.terminate(nil)
+            }
+            return
+        }
 #if DEBUG
         // `Faded --render-menu <out.png> [--expanded]` renders the popover to a
         // file and quits, so the layout can be reviewed without installing the

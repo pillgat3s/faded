@@ -21,6 +21,7 @@
 // ever sees a fake microphone.
 
 import AppKit
+import AVFoundation
 import CoreAudio
 import Foundation
 import Observation
@@ -56,6 +57,11 @@ final class AudioRouter {
     private(set) var driverStatus: DriverLink.Status = .notInstalled
     private(set) var allOutputs: [AudioDevice] = []
     private(set) var allInputs: [AudioDevice] = []
+    /// Paired Bluetooth headphones with no CoreAudio device yet (they are with
+    /// the iPhone, or in the case). Shown in the menu; picking one connects it.
+    private(set) var offlineBluetooth: [PairedBluetoothDevice] = []
+    /// MAC of the device currently being connected, for the row spinner.
+    private(set) var connectingBluetooth: String?
     private(set) var target: AudioDevice?
     private(set) var selectedInput: AudioDevice?
     private(set) var volume: Float = 1
@@ -110,6 +116,25 @@ final class AudioRouter {
             guard oldValue != showInputMeter else { return }
             defaults.set(showInputMeter, forKey: Keys.showInputMeter)
             if !showInputMeter { inputMeter.stop(); inputLevel = (0, 0) }
+        }
+    }
+
+    /// Route Bluetooth headphones through Faded like any other device.
+    ///
+    /// OFF by default, deliberately. AirPods-class devices carry their own
+    /// hardware volume (the keys work natively) and their whole ecosystem —
+    /// automatic switching between Mac and iPhone, ear-detection pause, the
+    /// connection banners — keys off macOS owning the default device. Every
+    /// time Faded reclaims the default from them, Apple's heuristics read it
+    /// as the user rejecting the AirPods and learn to stop switching. So in
+    /// native mode Faded stands aside while a Bluetooth device holds the
+    /// default, and returns the moment any other device does. The cost is
+    /// per-app volume for Mac apps during that time; browser tab volumes are
+    /// browser-side and keep working.
+    var routeBluetoothThroughFaded: Bool {
+        didSet {
+            guard oldValue != routeBluetoothThroughFaded else { return }
+            defaults.set(routeBluetoothThroughFaded, forKey: Keys.routeBluetooth)
         }
     }
 
@@ -231,6 +256,7 @@ final class AudioRouter {
         static let previousTargets = "previousTargets"
         static let showMeters = "showMeters"
         static let showInputMeter = "showInputMeter"
+        static let routeBluetooth = "routeBluetoothThroughFaded"
         static let showInputSection = "showInputSection"
         static let hiddenOutputs = "hiddenOutputUIDs"
         static let hiddenInputs = "hiddenInputUIDs"
@@ -241,6 +267,7 @@ final class AudioRouter {
         enabled = defaults.object(forKey: Keys.enabled) as? Bool ?? true
         showMeters = defaults.object(forKey: Keys.showMeters) as? Bool ?? true
         showInputMeter = defaults.bool(forKey: Keys.showInputMeter)   // opt-in: uses the mic
+        routeBluetoothThroughFaded = defaults.bool(forKey: Keys.routeBluetooth)
         showInputSection = defaults.object(forKey: Keys.showInputSection) as? Bool ?? true
         volumeByDevice = defaults.dictionary(forKey: Keys.volumeByDevice) as? [String: Float] ?? [:]
         mutedByDevice = defaults.dictionary(forKey: Keys.mutedByDevice) as? [String: Bool] ?? [:]
@@ -324,6 +351,12 @@ final class AudioRouter {
         }
         guard let initialTarget = initial else {
             lastError = "No output device to play to."
+            return
+        }
+
+        if initialTarget.transport == .bluetooth, !routeBluetoothThroughFaded,
+           AudioSystem.defaultOutputDevice == initialTarget.id {
+            standAside(for: initialTarget, reason: "bluetooth default at engage")
             return
         }
 
@@ -452,6 +485,13 @@ final class AudioRouter {
 
     func select(_ device: AudioDevice) {
         guard device.hasOutput, !device.isFadedDevice else { return }
+        // Native Bluetooth mode: hand the device to macOS outright, whichever
+        // state we were in — same behaviour as an auto-switch landing on it.
+        if device.transport == .bluetooth, !routeBluetoothThroughFaded {
+            setSystemDefault(to: device.id)
+            standAside(for: device, reason: "selected in menu")
+            return
+        }
         steppedAside = false
         if !isEngaged {
             if enabled, driver.isReady {
@@ -630,6 +670,15 @@ final class AudioRouter {
         }
         adoptRetry?.cancel()
         adoptRetry = nil
+
+        // Native Bluetooth mode: a BT headset holding the default is the
+        // intended steady state, not something to fight — reclaiming it reads
+        // to Apple's auto-switch heuristics as the user rejecting the device.
+        if let d = device, d.transport == .bluetooth, !routeBluetoothThroughFaded {
+            standAside(for: d, reason: "bluetooth handled natively")
+            return
+        }
+
         if adoptable, let device {
             if isEngaged {
                 Self.log.info("system default moved to \(device.name) — following")
@@ -662,10 +711,19 @@ final class AudioRouter {
         // Genuinely cannot follow it. Let macOS route natively rather than
         // fighting for the default and yanking playback away from the user.
         guard isEngaged else { return }
-        Self.log.notice("default moved somewhere Faded can't follow — stepping aside")
+        standAside(for: device, reason: "not adoptable")
+    }
+
+    /// Faded gets out of the audio path entirely, tracking the device only for
+    /// display: the header names it, and the menu's slider drives its hardware
+    /// volume directly. Idempotent so the watchdog can call it every tick.
+    private func standAside(for device: AudioDevice?, reason: String) {
+        if steppedAside, target?.uid == device?.uid { return }
+        trace("standing aside for \(device?.name ?? "?") (\(reason))")
         steppedAside = true
-        disengage(restoreDefault: false)
+        if isEngaged { disengage(restoreDefault: false) }
         target = device
+        installTargetListeners()
         readVolumeFromTargetDirectly()
     }
 
@@ -686,6 +744,11 @@ final class AudioRouter {
               let current = AudioSystem.defaultOutputDevice, current != 0,
               current != faded.id
         else { return }
+        if !routeBluetoothThroughFaded, let dev = AudioDevice(id: current),
+           dev.transport == .bluetooth {
+            standAside(for: dev, reason: "watchdog")
+            return
+        }
         trace("watchdog: default is \(current), not faded — adopting")
         steppedAside = false
         adopt(current, attempt: 0)
@@ -727,6 +790,10 @@ final class AudioRouter {
     func refreshDevices() {
         if previewMode { return }
         allOutputs = AudioDevice.selectableOutputs().sorted(by: Self.deviceOrder)
+        let uids = allOutputs.map(\.uid)
+        offlineBluetooth = BluetoothAudio.pairedAudioDevices()
+            .filter { bt in !uids.contains { BluetoothAudio.matches(uid: $0, id: bt.id) } }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         refreshInputs()
         if !isEngaged, target == nil {
             target = AudioSystem.defaultOutputDevice.flatMap(AudioDevice.init(id:))
@@ -742,6 +809,57 @@ final class AudioRouter {
             installInputListeners()
             readInputLevels()
 
+        }
+    }
+
+    /// Connect a paired-but-absent Bluetooth device — Control Center's move.
+    /// The Bluetooth link comes up off-main; audio arriving shows up as a new
+    /// CoreAudio device, which is then routed like any other selection.
+    func connectBluetooth(_ bt: PairedBluetoothDevice) {
+        guard connectingBluetooth == nil else { return }
+        connectingBluetooth = bt.id
+        trace("bt connect \(bt.name) (\(bt.id))")
+        let id = bt.id
+        DispatchQueue.global(qos: .userInitiated).async {
+            let linked = BluetoothAudio.connect(id)
+            Task { @MainActor [weak self] in
+                trace("bt link \(linked ? "up" : "FAILED") for \(id)")
+                // The link alone does not move AirPods audio to the Mac —
+                // ownership is negotiated with the other device by the
+                // system's routing arbiter. Asking it for playback is what
+                // Control Center effectively does; the CoreAudio device
+                // appears once arbitration lands.
+                AVAudioRoutingArbiter.shared.begin(category: .playback) { _, error in
+                    Task { @MainActor in
+                        trace("bt arbitration \(error.map { "error: \($0)" } ?? "granted")")
+                    }
+                }
+                self?.awaitBluetoothAudio(id, attempt: 0)
+            }
+        }
+    }
+
+    private func awaitBluetoothAudio(_ id: String, attempt: Int) {
+        guard connectingBluetooth == id else { return }
+        if let dev = AudioDevice.selectableOutputs()
+            .first(where: { BluetoothAudio.matches(uid: $0.uid, id: id) }) {
+            trace("bt audio up: \(dev.name) after \(Double(attempt) * 0.5)s")
+            AVAudioRoutingArbiter.shared.leave()
+            connectingBluetooth = nil
+            refreshDevices()
+            select(dev)
+            return
+        }
+        // Bluetooth audio profiles take seconds; 30 covers a phone handoff.
+        guard attempt < 60 else {
+            trace("bt audio never appeared for \(id)")
+            AVAudioRoutingArbiter.shared.leave()
+            connectingBluetooth = nil
+            refreshDevices()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            Task { @MainActor in self?.awaitBluetoothAudio(id, attempt: attempt + 1) }
         }
     }
 
@@ -812,7 +930,14 @@ final class AudioRouter {
     /// The *target's* hardware volume changed elsewhere (AirPods stem, another
     /// app) → reflect it on the Faded control so the two never disagree.
     private func targetControlChanged() {
-        guard isEngaged, !syncingVolume, let t = target, t.hasHardwareVolume else { return }
+        guard !syncingVolume, let t = target else { return }
+        guard isEngaged else {
+            // Standing aside: just reflect the device's own level in the menu.
+            if let v = t.volume { volume = v }
+            if let m = t.isMuted { muted = m }
+            return
+        }
+        guard t.hasHardwareVolume else { return }
         syncingVolume = true
         defer { syncingVolume = false }
         if let v = t.volume { driver.setFadedVolume(v); volume = v; volumeByDevice[t.uid] = v }
