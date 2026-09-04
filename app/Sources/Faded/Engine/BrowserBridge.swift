@@ -133,6 +133,7 @@ final class BrowserBridge: @unchecked Sendable {
         guard bound, Darwin.listen(fd, 2) == 0 else {
             close(fd)
             Self.log.error("bridge: could not bind \(path, privacy: .public)")
+            Task { @MainActor in trace("bridge: could not bind \(path) errno=\(errno)") }
             return
         }
         chmod(path, 0o600)  // this socket accepts volume commands; owner only
@@ -143,6 +144,7 @@ final class BrowserBridge: @unchecked Sendable {
         source.resume()
         listenSource = source
         Self.log.info("bridge: listening")
+        Task { @MainActor in trace("bridge: listening on \(path)") }
     }
 
     private func acceptClient() {
@@ -198,6 +200,7 @@ final class BrowserBridge: @unchecked Sendable {
                                   muted: t["muted"] as? Bool ?? false)
             }
             Self.log.info("bridge: snapshot with \(tabs.count) tab(s)")
+            Task { @MainActor in trace("bridge: snapshot with \(tabs.count) tab(s)") }
             Task { @MainActor in self.onTabs?(tabs) }
         case "bridge":
             break  // relay's own status; connection state is tracked by the socket
@@ -211,6 +214,7 @@ final class BrowserBridge: @unchecked Sendable {
         guard connected != isConnected else { return }
         isConnected = connected
         Self.log.info("bridge: extension \(connected ? "connected" : "disconnected")")
+        Task { @MainActor in trace("bridge: relay \(connected ? "connected" : "disconnected")") }
         Task { @MainActor [self] in
             if !connected { onTabs?([]) }
             onConnectionChanged?(connected)

@@ -104,6 +104,7 @@ async function setGain(tabId, url, gain) {
 // ---------------------------------------------------------------------------
 
 let nativePort = null;
+let nativeFailures = 0;
 
 function snapshotAndSend() {
   buildTabList()
@@ -126,6 +127,7 @@ function connectNativeBridge() {
     nativePort = null;
     return; // host manifest not installed (Faded.app has never run) — retry later
   }
+  nativeFailures = 0;
   nativePort.onMessage.addListener(async (message) => {
     switch (message?.type) {
       case 'ping':
@@ -145,10 +147,26 @@ function connectNativeBridge() {
     }
   });
   nativePort.onDisconnect.addListener(() => {
+    // Chrome sets lastError when the host could not be launched or died;
+    // reading it also keeps the "Unchecked runtime.lastError" noise out of
+    // the extension's error list.
+    const why = chrome.runtime.lastError?.message || 'port closed';
     nativePort = null;
-    setTimeout(connectNativeBridge, 15_000);
+    nativeFailures += 1;
+    console.debug(`faded bridge disconnected (${why}), attempt ${nativeFailures}`);
+    // A setTimeout would die with this service worker; the alarm below is
+    // what actually brings the bridge back. Retry quickly a few times in
+    // case the worker happens to stay alive, then leave it to the alarm.
+    if (nativeFailures <= 3) setTimeout(connectNativeBridge, 3_000);
   });
 }
+
+// The only reliable heartbeat an MV3 service worker has: an alarm fires even
+// when the worker was torn down, which is exactly when the bridge is gone.
+chrome.alarms.create('faded-bridge', { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'faded-bridge') connectNativeBridge();
+});
 
 chrome.runtime.onStartup.addListener(connectNativeBridge);
 chrome.runtime.onInstalled.addListener(connectNativeBridge);
@@ -325,6 +343,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // A tab that finishes loading needs its level re-applied: the content script
 // asks on its own, but this also covers same-document navigations.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  connectNativeBridge();
   if (changeInfo.audible !== undefined || changeInfo.mutedInfo !== undefined) snapshotAndSend();
 });
 

@@ -99,6 +99,7 @@ final class AppLink {
     /// failure notifies the extension and retries.
     func run() {
         var announcedDown = false
+        var retriesDown = 0
         while true {
             let sock = socket(AF_UNIX, SOCK_STREAM, 0)
             var addr = sockaddr_un()
@@ -114,13 +115,20 @@ final class AppLink {
             }
             if !connected {
                 close(sock)
-                if !announcedDown {
+                // Announce once, then keep a heartbeat flowing to Chrome: an
+                // MV3 service worker with a silent port is torn down after
+                // ~30 s, which closes the port and ends this process — and
+                // then nothing reconnects when Faded.app comes back. Traffic
+                // on the port resets that idle timer.
+                retriesDown += 1
+                if !announcedDown || retriesDown % 6 == 0 {
                     announcedDown = true
                     writeChromeMessage(Data(#"{"type":"bridge","connected":false}"#.utf8))
                 }
                 Thread.sleep(forTimeInterval: 3)
                 continue
             }
+            retriesDown = 0
 
             lock.lock(); fd = sock; lock.unlock()
             announcedDown = false
