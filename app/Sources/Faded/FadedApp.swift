@@ -31,7 +31,7 @@ private struct MenuBarLabel: View {
     }
 
     private var symbol: String {
-        if router.driverStatus != .ready { return "speaker.badge.exclamationmark" }
+        if !router.isAudioReady { return "speaker.badge.exclamationmark" }
         if router.muted || router.volume <= 0.001 { return "speaker.slash" }
         if router.volume < 0.34 { return "speaker.wave.1" }
         if router.volume < 0.67 { return "speaker.wave.2" }
@@ -52,6 +52,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // headless and reports to the trace file. Release builds too: the
         // Bluetooth TCC grant belongs to the installed app, so the probe must
         // run as it.
+        if let i = CommandLine.arguments.firstIndex(of: "--tap-probe") {
+            let args = CommandLine.arguments
+            let mode = i + 1 < args.count ? args[i + 1] : "full"
+            let secs = i + 2 < args.count ? Double(args[i + 2]) ?? 10 : 10
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(1))
+                TapProbe.run(mode: mode, seconds: secs) {
+                    self.router.shutdown()
+                    NSApp.terminate(nil)
+                }
+            }
+            return
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--bt-connect"),
            i + 1 < CommandLine.arguments.count {
             let mac = CommandLine.arguments[i + 1]
@@ -143,7 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let settings = menu.addItem(withTitle: "Faded Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self
 
-        let route = menu.addItem(withTitle: "Route Audio Through Faded", action: #selector(toggleRouting), keyEquivalent: "")
+        let route = menu.addItem(withTitle: "Per-App Volume", action: #selector(toggleRouting), keyEquivalent: "")
         route.target = self
         route.state = router.enabled ? .on : .off
 

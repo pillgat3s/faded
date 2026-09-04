@@ -62,6 +62,7 @@ targets:
         # The menu lists paired headphones that are not audio-connected yet
         # (e.g. AirPods currently with the iPhone) and connects them on click,
         # like Control Center — that enumeration needs Bluetooth access.
+        NSAudioCaptureUsageDescription: "Faded adjusts each app's volume by capturing its audio and playing it back at the level you set. Nothing is recorded or stored."
         NSBluetoothAlwaysUsageDescription: "Faded lists your paired headphones and connects them when you pick one — the same as choosing them in Control Center."
 schemes:
   Faded:

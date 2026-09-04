@@ -26,8 +26,9 @@ struct MenuView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            if router.driverStatus == .ready {
+            if router.isAudioReady {
                 if router.steppedAside { steppedAsideBanner }
+                if router.needsAccessibility { accessibilityHint }
                 outputSlider
                 outputSection
                 if router.showInputSection, !router.allInputs.isEmpty { inputSection }
@@ -123,12 +124,14 @@ struct MenuView: View {
                     offlineBluetoothRow(bt)
                 }
                 if router.hasHiddenDevices { showMoreRow }
-                Text("AirPlay speakers: choose them in Control Center.")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 16)
-                    .padding(.top, 3)
+                if !router.isNative {
+                    Text("AirPlay speakers: choose them in Control Center.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 3)
+                }
             } else if let t = router.target,
                       let dev = router.allOutputs.first(where: { $0.uid == t.uid }) {
                 deviceRow(dev, selected: true, kind: .output)
@@ -168,13 +171,34 @@ struct MenuView: View {
         .disabled(router.connectingBluetooth != nil)
     }
 
+    /// The volume keys on a device without hardware volume need Accessibility.
+    private var accessibilityHint: some View {
+        Button { router.requestAccessibility() } label: {
+            HStack(spacing: 7) {
+                Image(systemName: "keyboard")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Text("\(router.target?.name ?? "This device") has no volume control of its own. Allow Faded in Accessibility so the volume keys work here.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .multilineTextAlignment(.leading)
+            }
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
+    }
+
     /// Shown when macOS has routed output somewhere Faded cannot follow.
     private var steppedAsideBanner: some View {
         HStack(spacing: 7) {
             Image(systemName: "airplayaudio")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
-            Text(router.target?.transport == .bluetooth
+            Text(router.isNative
+                 ? "macOS is routing audio directly\(router.target.map { " to \($0.name)" } ?? ""); per-app volume is paused here."
+                 : router.target?.transport == .bluetooth
                  ? "\(router.target?.name ?? "Your headphones") are handled natively — auto-switching with your iPhone and ear detection work as usual. Per-app volume resumes on other devices."
                  : "macOS is routing audio directly\(router.target.map { " to \($0.name)" } ?? ""). Faded is standing by.")
                 .font(.system(size: 11))

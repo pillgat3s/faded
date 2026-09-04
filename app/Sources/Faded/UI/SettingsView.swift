@@ -60,14 +60,31 @@ private struct GeneralSettings: View {
                             launchAtLogin = SMAppService.mainApp.status == .enabled
                         }
                     }
-                Toggle("Route audio through Faded", isOn: $router.enabled)
-                Toggle("Also route Bluetooth headphones through Faded", isOn: $router.routeBluetoothThroughFaded)
-                Text("Off keeps AirPods fully native: automatic Mac-iPhone switching, ear detection and the volume keys all work exactly as without Faded — only per-app volume pauses while they hold the output. On gives per-app volume on Bluetooth too, at the cost of that native behaviour.")
-                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Per-app volume and volume keys", isOn: $router.enabled)
                 Text(router.enabled
                      ? "Volume keys work on every device, and each app gets its own level."
                      : "Faded is passive: macOS handles audio exactly as it would without it.")
                     .font(.caption).foregroundStyle(.secondary)
+                Picker("Engine", selection: $router.engineMode) {
+                    Text("Native (recommended)").tag(AudioRouter.EngineMode.native)
+                    Text("Virtual device").tag(AudioRouter.EngineMode.virtualDevice)
+                }
+                Text(router.isNative
+                     ? "Native taps each app's audio and plays it back at the level you set, while your real device stays the system output — AirPods switching, ear detection, AirPlay and Control Center all behave exactly as without Faded. Needs the System Audio Recording permission once; nothing is recorded."
+                     : "The virtual device puts Faded in front of the system output. It needs the audio driver, and it takes the default device away from macOS, which breaks AirPods automatic switching.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if !router.isNative {
+                    Toggle("Also route Bluetooth headphones through Faded", isOn: $router.routeBluetoothThroughFaded)
+                }
+                if router.isNative {
+                    LabeledContent("Volume keys on devices without volume") {
+                        if MediaKeyTap.hasAccessibility {
+                            Label("Accessibility allowed", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                        } else {
+                            Button("Allow in Accessibility…") { router.requestAccessibility() }
+                        }
+                    }
+                }
             } header: { Text("Behaviour") }
 
             Section {
@@ -80,6 +97,10 @@ private struct GeneralSettings: View {
             } header: { Text("Menu") }
 
             Section {
+                if router.isNative {
+                    Text("Not needed by the native engine. Uninstall it if you don't plan to switch back.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 LabeledContent("Status") {
                     switch router.driverStatus {
                     case .ready: Label("Installed and running", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
