@@ -9,6 +9,13 @@
 //   * per site  — the last level you chose for an origin becomes the starting
 //                 point for the next tab you open on that origin. Persisted.
 //
+// A tab's level is pinned the first time the tab is seen (seeded from the
+// site's remembered level), so changing one YouTube tab never moves another
+// that is already open — only tabs opened afterwards start from the new
+// level. Entries are {gain, origin, explicit}: `explicit` marks a level the
+// user set for that tab, which survives navigation; a seeded one is re-seeded
+// when the tab moves to a different site.
+//
 // MV3 service workers are killed aggressively, so nothing is cached in module
 // scope; every handler reads storage. It's a few hundred bytes.
 
@@ -37,11 +44,14 @@ async function tabGains() {
   return tabs;
 }
 
-async function setTabGain(tabId, gain) {
+async function setTabGain(tabId, gain, url) {
   const tabs = await tabGains();
-  if (gain === DEFAULT_GAIN) delete tabs[tabId];
-  else tabs[tabId] = gain;
+  tabs[tabId] = { gain, origin: originOf(url), explicit: true };
   await chrome.storage.session.set({ tabs });
+}
+
+function hasUserOverrides(tabs) {
+  return Object.values(tabs).some((e) => e && e.explicit && e.gain !== DEFAULT_GAIN);
 }
 
 function originOf(url) {
@@ -53,14 +63,21 @@ function originOf(url) {
   }
 }
 
-/** Effective gain for a tab: its own override, else the site default, else 1. */
+/** Effective gain for a tab: its pinned level, seeded from the site default
+ * the first time the tab (or a new site in it) is seen. */
 async function gainFor(tabId, url) {
   const tabs = await tabGains();
-  if (tabs[tabId] !== undefined) return tabs[tabId];
   const origin = originOf(url);
-  if (!origin) return DEFAULT_GAIN;
-  const sites = await siteGains();
-  return sites[origin] ?? DEFAULT_GAIN;
+  const entry = tabs[tabId];
+  if (entry && (entry.explicit || entry.origin === origin)) return entry.gain;
+  let gain = DEFAULT_GAIN;
+  if (origin) {
+    const sites = await siteGains();
+    gain = sites[origin] ?? DEFAULT_GAIN;
+  }
+  tabs[tabId] = { gain, origin, explicit: false };
+  await chrome.storage.session.set({ tabs });
+  return gain;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,7 +104,7 @@ function updateBadge(tabId, gain) {
 
 async function setGain(tabId, url, gain) {
   const value = Math.max(0, Math.min(1, Number(gain) || 0));
-  await setTabGain(tabId, value);
+  await setTabGain(tabId, value, url);
   await setSiteGain(originOf(url), value);
   await applyToTab(tabId, value);
   snapshotAndSend();
@@ -253,7 +270,7 @@ async function buildTabList(probeHooks = false) {
     });
   }
   const list = [...byId.values()].sort((a, b) => Number(b.active) - Number(a.active));
-  return { tabs: list, hasOverrides: Object.keys(overrides).length > 0 };
+  return { tabs: list, hasOverrides: hasUserOverrides(overrides) };
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +316,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         // Active tab first, then whatever is making noise.
         const list = [...byId.values()].sort((a, b) => Number(b.active) - Number(a.active));
-        return sendResponse({ tabs: list, hasOverrides: Object.keys(tabs).length > 0 });
+        return sendResponse({ tabs: list, hasOverrides: hasUserOverrides(tabs) });
       }
 
       case 'setGain': {
