@@ -27,7 +27,7 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>Faded uses an administrator prompt to install its audio driver.</string>
+	<string>Faded asks for an administrator password only to remove the audio driver an older version installed.</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>Faded adjusts each app's volume by capturing its audio and playing it back at the level you set. Nothing is recorded or stored.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>

@@ -111,15 +111,17 @@ struct AudioDevice: Identifiable, Hashable, Sendable {
 
     /// Output-capable, non-hidden devices, excluding Faded's own virtual ones.
     static func selectableOutputs() -> [AudioDevice] {
-        all().filter { $0.hasOutput && !$0.isHidden && !$0.isFadedDevice }
+        all().filter { $0.hasOutput && !$0.isHidden && !$0.isLegacyFadedDevice }
     }
 
     /// Input-capable, non-hidden devices, excluding Faded's own virtual ones.
     static func selectableInputs() -> [AudioDevice] {
-        all().filter { $0.hasInput && !$0.isHidden && !$0.isFadedDevice }
+        all().filter { $0.hasInput && !$0.isHidden && !$0.isLegacyFadedDevice }
     }
 
-    var isFadedDevice: Bool { uid == FadedProtocol.outputDeviceUID }
+    /// The device the original driver-based engine published, if that
+    /// driver is still installed. Never listed, never played to.
+    var isLegacyFadedDevice: Bool { uid == Faded.legacyDeviceUID }
 
     var isAlive: Bool {
         let alive = (try? AudioObject.get(id, .init(kAudioDevicePropertyDeviceIsAlive), as: UInt32.self)) ?? 0

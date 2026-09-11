@@ -2,16 +2,17 @@
 local.mk
 
 # build outputs
-driver/test/build/
-driver/test/harness
-driver/test/trace
-*.dSYM/
 build/
-driver/build/
 app/build/
+bridge/build/
 app/Faded.xcodeproj/
+*.dSYM/
+
 # xcode
 xcuserdata/
 *.xcuserstate
 DerivedData/
 .DS_Store
+
+# moved to github.com/pillgat3s/faded-tabs; an untracked copy may linger locally
+extension/

@@ -34,10 +34,13 @@ struct BrowserTab: Identifiable, Hashable, Sendable {
 /// surface is thread-safe and callbacks hop to the main actor. (Not @MainActor
 /// itself — the read/accept handlers run on the queue by construction.)
 final class BrowserBridge: @unchecked Sendable {
-    private static let log = Logger(subsystem: FadedProtocol.appBundleID, category: "Bridge")
+    private static let log = Logger(subsystem: Faded.bundleID, category: "Bridge")
 
     static let hostName = "com.andri.faded"
-    static let extensionID = "epggnfcikpcfaklnoljedmlbaibllofm"
+    /// Extension IDs allowed to reach the app. The first is the ID an unpacked
+    /// copy of Faded Tabs gets (its manifest carries a fixed key); a Chrome Web
+    /// Store install has the ID the store assigns — add it here once known.
+    static let extensionIDs = ["epggnfcikpcfaklnoljedmlbaibllofm"]
 
     var onTabs: (@MainActor ([BrowserTab]) -> Void)?
     var onConnectionChanged: (@MainActor (Bool) -> Void)?
@@ -239,7 +242,7 @@ final class BrowserBridge: @unchecked Sendable {
             "description": "Faded browser tab volume bridge",
             "path": helper.path,
             "type": "stdio",
-            "allowed_origins": ["chrome-extension://\(Self.extensionID)/"],
+            "allowed_origins": Self.extensionIDs.map { "chrome-extension://\($0)/" },
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
         else { return }

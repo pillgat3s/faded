@@ -4,7 +4,7 @@ A macOS menu bar sound control shaped like the stock Control Center Sound
 module, with the parts macOS is missing.
 
 <p align="center">
-  <img src="docs/menu.png" width="352" alt="Faded's menu: Sound title, output slider, Output and Input device lists with level meters, and an Apps section with per-app sliders">
+  <img src="docs/menu.png" width="352" alt="Faded's menu: Sound title, output slider, Output and Input device lists with level meters, an Apps section with per-app sliders, and Chrome tabs">
 </p>
 
 - **The volume keys work on every output device** — including the ones that
@@ -19,9 +19,12 @@ module, with the parts macOS is missing.
 - **Output and input devices in one panel**, the way Control Center does it —
   including paired AirPods that are currently with your iPhone: pick them and
   Faded connects them, like Control Center would.
+- **Browser tabs in the same menu**, with the
+  [Faded Tabs](https://github.com/pillgat3s/faded-tabs) extension for Chrome
+  and Brave — per-tab volume, next to the per-app sliders.
 - **Level meters** beside each device and app.
 - **Hide devices** you never use — they collapse behind "Show More".
-- Small Settings window, launch at login.
+- Small Settings window, launch at login. Nothing to install besides the app.
 
 Deliberately **not** included: volume boost above 100 %, sample-rate switching,
 balance, an equalizer, per-app device redirection. If you want those, buy
@@ -71,7 +74,7 @@ an audible blip. The tap mutes the process at the device and hands Faded its
 audio; Faded applies the app's gain, sums everything, and plays the result to
 the very same device through a private aggregate device that uses it as the
 clock master. One IO cycle of latency (about 10 ms), no resampling, no drift
-compensation, no shared memory, no driver.
+compensation, no driver, nothing installed anywhere.
 
 **Volume keys.** Devices with hardware volume are left entirely to macOS — the
 keys, the Control Center slider and AirPods stem gestures all work natively
@@ -106,44 +109,27 @@ one brings the Bluetooth link up and asks the system's routing arbiter
 (`AVAudioRoutingArbiter`) for playback — the arbiter is what actually moves
 AirPods audio to the Mac; the link alone never does.
 
-### AirPlay
+**AirPlay.** An AirPlay speaker is not a CoreAudio device while it is idle —
+macOS discovers those over the network — so it can't be listed here. Pick one
+in Control Center: macOS materialises a real device called "AirPlay" and makes
+it the default, and Faded follows it like any other device. If a device
+genuinely cannot be followed, Faded steps aside and says so in the menu; audio
+keeps flowing natively, per-app volume pauses there.
 
-An AirPlay speaker is **not** a CoreAudio device while it is idle — a Sonos or
-an Apple TV appears in the stock Sound menu but nowhere in the HAL device list,
-because macOS discovers those over the network rather than through the audio
-stack. Pick one in Control Center: macOS materialises a real CoreAudio device
-called "AirPlay" and makes it the default, and Faded follows it like any other
-device. If a device genuinely cannot be followed, Faded steps aside and says
-so in the menu; audio keeps flowing natively, per-app volume pauses there.
-
-### The virtual-device engine (legacy)
-
-Faded's first engine was a HAL plug-in ([`driver/`](driver/)): a virtual
-"Faded" device that every app played into, with the mix pulled out over a
-shared-memory ring and played to the real device. It is still in the tree and
-selectable in Settings → Engine, mainly as a reference: it works, but it makes
-Faded the owner of the system default device, and a surprising amount of macOS
-keys off exactly that — most visibly AirPods automatic switching, which reads
-every reclaim of the default as you rejecting the AirPods. The native engine
-needs none of it, and nothing has to be installed.
-
-## Per-tab volume in the browser
+## Browser tabs
 
 A browser is one audio client as far as macOS is concerned — Chrome and Brave
 mix every tab through a single audio service process, and Safari routes all
 media through `com.apple.WebKit.GPU`. At the CoreAudio layer there is literally
-one stream, so no audio driver, Faded's or anyone else's, can separate tabs.
+one stream, so no audio engine, Faded's or anyone else's, can separate tabs.
 
-[`extension/`](extension/) is a companion Chrome/Brave extension that does it
-from inside the browser instead: it intercepts `HTMLMediaElement.volume` and
-the Web Audio destination in each page, giving every tab its own level. Load it
-unpacked from `chrome://extensions` — see [its README](extension/README.md).
-With the extension installed, the tabs also appear inside Faded's own menu
-through a small native-messaging bridge.
-
-<p align="center">
-  <img src="docs/extension.png" width="320" alt="The Faded Tabs popup: one row per tab with favicon, title, percentage and volume slider">
-</p>
+[Faded Tabs](https://github.com/pillgat3s/faded-tabs) is the companion
+Chrome/Brave extension that does it from inside the browser instead. With both
+installed, the tabs also appear in Faded's own menu: Chrome launches a tiny
+relay ([`bridge/`](bridge/)) through native messaging, the relay dials the
+app's unix socket, and JSON goes both ways. The app writes the native-messaging
+host manifest for every Chromium-family browser it finds on each launch, so
+there is nothing to configure. Either half is fully useful without the other.
 
 ## Privacy
 
@@ -165,12 +151,11 @@ through a small native-messaging bridge.
 
 ## Build
 
-Requires Xcode 26, and `brew install cmake xcodegen`.
+Requires Xcode 26 and `brew install xcodegen`.
 
 ```bash
-make            # driver + app → build/Faded.app
-make driver     # just the legacy HAL plug-in
-make app        # just the app (embeds the driver for the legacy engine)
+make            # → build/Faded.app
+make install    # copies it to /Applications and opens it
 make clean
 ```
 
@@ -185,18 +170,18 @@ echo 'CODESIGN_ID = Apple Development: you@example.com (TEAMID)' > local.mk
 
 `local.mk` is untracked.
 
-### Looking at the UI without installing anything
+### Looking at the UI without touching audio
 
-Debug builds can rasterise the menu to a PNG. No audio touched:
+Debug builds can rasterise the menu to a PNG:
 
 ```bash
+make app CONFIG=Debug
 ./app/build/Build/Products/Debug/Faded.app/Contents/MacOS/Faded \
     --render-menu /tmp/menu.png --expanded --demo
 ```
 
 (`--demo` substitutes invented device names, which is how the screenshot above
-is generated. The Settings window can't be rendered this way — `TabView` and
-grouped `Form` are AppKit-backed and come out blank.)
+is generated.)
 
 Two headless probes exercise the interesting paths and report to the trace
 file: `Faded --tap-probe [full|unmuted|notap] [seconds]` runs a minimal tap
@@ -204,12 +189,12 @@ engine, and `Faded --bt-connect <mac>` runs the Bluetooth connect flow.
 
 ## Install
 
-```bash
-make install    # copies build/Faded.app to /Applications and opens it
-```
+`make install`, allow the System Audio Recording prompt, done. Nothing is
+installed anywhere else.
 
-That is all. Allow the System Audio Recording prompt and Faded is working;
-nothing is installed anywhere else.
+Earlier versions of Faded routed audio through a HAL driver of their own. If
+one is still on your machine, Settings shows a **Remove Old Driver…** button;
+it asks for your password once and restarts the audio system.
 
 ## Uninstall
 
@@ -217,9 +202,9 @@ nothing is installed anywhere else.
 make uninstall
 ```
 
-Removes the app and its preferences (and the legacy driver, if you ever
-installed it). No launch agents, no daemons, no login items unless you turn
-one on.
+Removes the app, its preferences and its support folder (and the old driver, if
+one is installed). No launch agents, no daemons, no login items unless you
+turn one on.
 
 ## Known limitations
 
@@ -236,6 +221,4 @@ one on.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Third-party code is listed in
-[THIRD-PARTY.md](THIRD-PARTY.md); the legacy driver is built on
-[libASPL](https://github.com/gavv/libASPL) by Victor Gaydov, also MIT.
+MIT — see [LICENSE](LICENSE).

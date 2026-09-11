@@ -17,31 +17,34 @@ struct MenuView: View {
     @AppStorage("menuOutputExpanded") private var outputExpanded = true
     @AppStorage("menuInputExpanded") private var inputExpanded = true
     @State private var showingHidden = false
-    @State private var appsExpanded = false
-    @State private var installError: String?
+    @State private var appsExpanded: Bool
     @Environment(\.openSettings) private var openSettings
 
     private let width: CGFloat = 340
 
+    init(router: AudioRouter, previewExpandApps: Bool = false) {
+        _router = Bindable(wrappedValue: router)
+        self.previewExpandApps = previewExpandApps
+        // Set up front rather than in onAppear: ImageRenderer measures the
+        // view before onAppear runs, and a menu measured collapsed but drawn
+        // expanded comes out cropped.
+        _appsExpanded = State(initialValue: previewExpandApps)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            if router.isAudioReady {
-                if router.steppedAside { steppedAsideBanner }
-                if router.needsAccessibility { accessibilityHint }
-                outputSlider
-                outputSection
-                if router.showInputSection, !router.allInputs.isEmpty { inputSection }
-                appsSection
-            } else {
-                driverCard
-            }
+            if router.steppedAside { steppedAsideBanner }
+            if router.needsAccessibility { accessibilityHint }
+            outputSlider
+            outputSection
+            if router.showInputSection, !router.allInputs.isEmpty { inputSection }
+            appsSection
             footer
         }
         .frame(width: width)
         .padding(.vertical, 8)
         .onAppear {
-            appsExpanded = appsExpanded || previewExpandApps
             router.refreshDevices()
             router.refreshApps()
             router.startMetering()
@@ -50,9 +53,6 @@ struct MenuView: View {
         // NB: MenuBarExtra(.window) builds this view at launch and does not
         // reliably send onDisappear, so the router also checks popover
         // visibility on every tick — see AudioRouter.startMetering().
-        .alert("Driver", isPresented: Binding(get: { installError != nil }, set: { if !$0 { installError = nil } })) {
-            Button("OK") { installError = nil }
-        } message: { Text(installError ?? "") }
     }
 
     // MARK: Header
@@ -124,14 +124,6 @@ struct MenuView: View {
                     offlineBluetoothRow(bt)
                 }
                 if router.hasHiddenDevices { showMoreRow }
-                if !router.isNative {
-                    Text("AirPlay speakers: choose them in Control Center.")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.horizontal, 16)
-                        .padding(.top, 3)
-                }
             } else if let t = router.target,
                       let dev = router.allOutputs.first(where: { $0.uid == t.uid }) {
                 deviceRow(dev, selected: true, kind: .output)
@@ -196,11 +188,7 @@ struct MenuView: View {
             Image(systemName: "airplayaudio")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
-            Text(router.isNative
-                 ? "macOS is routing audio directly\(router.target.map { " to \($0.name)" } ?? ""); per-app volume is paused here."
-                 : router.target?.transport == .bluetooth
-                 ? "\(router.target?.name ?? "Your headphones") are handled natively — auto-switching with your iPhone and ear detection work as usual. Per-app volume resumes on other devices."
-                 : "macOS is routing audio directly\(router.target.map { " to \($0.name)" } ?? ""). Faded is standing by.")
+            Text("macOS is routing audio directly\(router.target.map { " to \($0.name)" } ?? ""). Per-app volume is paused here; Faded keeps trying.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -475,48 +463,6 @@ struct MenuView: View {
         .padding(.leading, 30)
         .padding(.trailing, 16)
         .padding(.vertical, 2)
-    }
-
-    // MARK: Driver card
-
-    private var driverCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            switch router.driverStatus {
-            case .notInstalled:
-                Label("Audio driver not installed", systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 12, weight: .semibold))
-                Text("Faded needs a small audio driver to control per-app volume and devices that have no volume control of their own. Installing asks for your password once and restarts the audio system (about a second of silence).")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-                Button("Install Driver…") { runInstall { try DriverInstaller.install() } }
-                    .buttonStyle(.borderedProminent).controlSize(.small)
-            case let .incompatible(found):
-                Label("Driver needs updating (installed v\(found))", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 12, weight: .semibold))
-                Button("Update Driver…") { runInstall { try DriverInstaller.install() } }
-                    .buttonStyle(.borderedProminent).controlSize(.small)
-            case .ready:
-                EmptyView()
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.bottom, 12)
-    }
-
-    private func runInstall(_ op: () throws -> Void) {
-        do {
-            try op()
-            Task { @MainActor in
-                for _ in 0 ..< 20 {
-                    try? await Task.sleep(for: .milliseconds(500))
-                    router.driver.refresh()
-                    if router.driver.isReady { router.engage(); break }
-                }
-            }
-        } catch DriverInstaller.InstallError.cancelled {
-            // user hit cancel — nothing to say
-        } catch {
-            installError = error.localizedDescription
-        }
     }
 
     // MARK: Footer

@@ -1,24 +1,24 @@
-// AudioRouter.swift — the brain. Owns the driver link, the play-through
-// engine, the "which real device are we playing to" decision, volume
-// mirroring, input selection, per-app gains, meters and persistence.
+// AudioRouter.swift — the brain. Owns the tap engine, the "which device is
+// the system output" bookkeeping, volume, input selection, per-app gains,
+// meters, the browser bridge and persistence.
 //
-// Invariants while engaged:
-//   * macOS default output == "Faded" (so every app plays into the driver).
-//   * `target` is the real device Faded.app plays to.
-//   * The Faded device's volume/mute controls always show the *target's*
-//     level. If the target has hardware volume we mirror the value onto it and
-//     tell the driver to bypass its own gain (no double attenuation); if it
-//     doesn't (Astro A50 & friends) the driver applies the gain in software.
-//     Either way the keyboard volume keys drive the Faded control, which is
-//     the whole point.
-//   * When macOS or the user changes the default output to something else
-//     (Control Center, AirPods auto-switch, AirPlay pick), we adopt that
-//     device as the new target and put Faded back as default. That is what
-//     keeps AirPlay/AirPods behaving exactly like the stock menu.
+// Invariants:
+//   * The system default output device is macOS's to own. Faded never sets it
+//     except when you pick a device in Faded's own menu — the same act as
+//     picking it in Control Center.
+//   * `target` is whatever device is the system default right now.
+//   * The tap engine plays to `target`. Its stream runs only while some app is
+//     running output, so what the system sees is what it would see without
+//     Faded (an open stream is what makes in-ear AirPods jump over from a
+//     phone, so this matters).
+//   * Devices with hardware volume are left to macOS — the keys, Control
+//     Center and AirPods stem gestures all work natively and Faded only
+//     reflects them. Devices without one get a software master gain in the
+//     mix, and Faded takes the volume keys for them.
 //
-// Input is *not* interposed: Faded selects the system input device and drives
-// its hardware volume/mute directly. Nothing sits in the mic path, so no app
-// ever sees a fake microphone.
+// Input is not interposed: Faded selects the system input device and drives
+// its hardware volume/mute directly, so nothing of Faded's ever turns up in a
+// microphone picker.
 
 import AppKit
 import AVFoundation
@@ -50,13 +50,12 @@ func trace(_ message: String) {
 @MainActor
 @Observable
 final class AudioRouter {
-    private static let log = Logger(subsystem: FadedProtocol.appBundleID, category: "Router")
+    private static let log = Logger(subsystem: Faded.bundleID, category: "Router")
 
     // MARK: Observable state
 
-    private(set) var driverStatus: DriverLink.Status = .notInstalled
     /// The volume keys need the Accessibility permission on devices without
-    /// hardware volume (native engine). True while that is missing.
+    /// hardware volume. True while that is missing and such a device is current.
     private(set) var needsAccessibility = false
     private(set) var allOutputs: [AudioDevice] = []
     private(set) var allInputs: [AudioDevice] = []
@@ -75,43 +74,26 @@ final class AudioRouter {
     /// Chrome tabs, live from the Faded Tabs extension over the native bridge.
     private(set) var browserTabs: [BrowserTab] = []
     private(set) var browserBridgeConnected = false
+    /// True while the tap engine owns the audio path.
     private(set) var isEngaged = false
     private(set) var lastError: String?
-    /// True when macOS is routing output somewhere Faded cannot follow (an
-    /// AirPlay speaker). Faded is passive and the menu says so.
+    /// True when the current default device could not be followed (the tap
+    /// engine failed on it). Audio flows natively; per-app volume pauses.
     private(set) var steppedAside = false
 
-    /// Master output meter (L, R), 0…1 — straight from the driver.
+    /// Master output meter (L, R), 0…1.
     private(set) var outputLevel: (Float, Float) = (0, 0)
     /// Selected input meter (L, R), 0…1.
     private(set) var inputLevel: (Float, Float) = (0, 0)
 
     // MARK: Settings (persisted)
 
-    enum EngineMode: String { case native, virtualDevice }
-
-    /// Native: process taps, the real device stays the system default (macOS
-    /// keeps AirPods switching, ear detection, AirPlay, everything). Virtual
-    /// device: the original driver-based routing, kept as a fallback.
-    var engineMode: EngineMode {
-        didSet {
-            guard oldValue != engineMode else { return }
-            defaults.set(engineMode.rawValue, forKey: Keys.engineMode)
-            let wasEnabled = enabled
-            if wasEnabled { disengage(restoreDefault: true, mode: oldValue) }
-            if wasEnabled { engage() }
-        }
-    }
-    var isNative: Bool { engineMode == .native }
-    /// The menu can show its full self: native needs nothing installed.
-    var isAudioReady: Bool { isNative || driverStatus == .ready }
-
-    /// Route audio through Faded (false = leave macOS completely alone).
+    /// Per-app volume and the volume keys (false = leave macOS completely alone).
     var enabled: Bool {
         didSet {
             guard oldValue != enabled else { return }
             defaults.set(enabled, forKey: Keys.enabled)
-            enabled ? engage() : disengage(restoreDefault: true)
+            enabled ? engage() : disengage()
         }
     }
 
@@ -127,35 +109,15 @@ final class AudioRouter {
     /// Draw a live level meter for the selected *input* device.
     ///
     /// Off by default, and deliberately separate from `showMeters`: output
-    /// metering is free (the driver already has the mixed buffer), but there is
-    /// no property anywhere in CoreAudio that reports an input's level, so this
-    /// one has to open a capture stream — which lights the orange microphone
-    /// indicator in the menu bar for as long as it runs. Faded does not do that
-    /// unless you ask for it.
+    /// metering is free (the mix is already in hand), but there is no property
+    /// anywhere in CoreAudio that reports an input's level, so this one has to
+    /// open a capture stream — which lights the orange microphone indicator in
+    /// the menu bar for as long as it runs. Faded does not do that unless asked.
     var showInputMeter: Bool {
         didSet {
             guard oldValue != showInputMeter else { return }
             defaults.set(showInputMeter, forKey: Keys.showInputMeter)
             if !showInputMeter { inputMeter.stop(); inputLevel = (0, 0) }
-        }
-    }
-
-    /// Route Bluetooth headphones through Faded like any other device.
-    ///
-    /// OFF by default, deliberately. AirPods-class devices carry their own
-    /// hardware volume (the keys work natively) and their whole ecosystem —
-    /// automatic switching between Mac and iPhone, ear-detection pause, the
-    /// connection banners — keys off macOS owning the default device. Every
-    /// time Faded reclaims the default from them, Apple's heuristics read it
-    /// as the user rejecting the AirPods and learn to stop switching. So in
-    /// native mode Faded stands aside while a Bluetooth device holds the
-    /// default, and returns the moment any other device does. The cost is
-    /// per-app volume for Mac apps during that time; browser tab volumes are
-    /// browser-side and keep working.
-    var routeBluetoothThroughFaded: Bool {
-        didSet {
-            guard oldValue != routeBluetoothThroughFaded else { return }
-            defaults.set(routeBluetoothThroughFaded, forKey: Keys.routeBluetooth)
         }
     }
 
@@ -199,7 +161,6 @@ final class AudioRouter {
         var gain: Float      // 0…1 (no boost)
         var muted: Bool
         var peak: Float
-        var keys: Set<String>
         var isBare: Bool
         var starred: Bool
         var isPlaying: Bool
@@ -220,60 +181,48 @@ final class AudioRouter {
 
     // MARK: Internals
 
-    let driver = DriverLink()
     let bridge = BrowserBridge()
     let tapEngine = TapEngine()
     private let mediaKeys = MediaKeyTap()
     private let hud = VolumeHUD()
-    private let engine = PlayThrough()
-    private var nativePeaks: [AudioObjectID: Float] = [:]
-    private var resolvedByProcess: [AudioObjectID: ResolvedApp] = [:]
-    private var nativePollTimer: Timer?
-    private var nativeIdlePaused = false
-    private var nativeStopWork: DispatchWorkItem?
-    private var nativeStartFailures = 0
-    private var nativeRetryAfter = Date.distantPast
-    private var activity: NSObjectProtocol?
-    private var lastSignal = Date()
-    private var followRetry: DispatchWorkItem?
     private let inputMeter = InputMeter()
     private let defaults = UserDefaults.standard
 
     private var defaultOutputListener: ListenerToken?
     private var defaultInputListener: ListenerToken?
     private var deviceListListener: ListenerToken?
-    private var fadedControlListeners: [ListenerToken] = []
     private var targetControlListeners: [ListenerToken] = []
-    private var targetRateListener: ListenerToken?
-    private var fadedRateListener: ListenerToken?
-    private var fadedRunningListener: ListenerToken?
-    private var idlePauseTimer: Timer?
-    private var reconcileTimer: Timer?
     private var inputControlListeners: [ListenerToken] = []
+    private var reconcileTimer: Timer?
     private var meterTimer: Timer?
-    private var healthTimer: Timer?
-    private var lastHealth: (under: UInt64, resync: UInt64) = (0, 0)
-    private var adoptRetry: DispatchWorkItem?
+    private var pollTimer: Timer?
+    private var followRetry: DispatchWorkItem?
+    private var stopWork: DispatchWorkItem?
+    private var startFailures = 0
+    private var retryAfter = Date.distantPast
+    private var activity: NSObjectProtocol?
     private var idleTicks = 0
+    private var pollTicks = 0
+    private var lastSignal = Date()
+    private var peaksByProcess: [AudioObjectID: Float] = [:]
+    private var resolvedByProcess: [AudioObjectID: ResolvedApp] = [:]
 
     private var previewMode = false      // DEBUG --render-menu only
     private var settingDefault = false   // re-entrancy guard for default-device writes
-    private var syncingVolume = false    // re-entrancy guard for volume mirroring
 
-    private var volumeByDevice: [String: Float]
+    private var volumeByDevice: [String: Float]  // software master, per device without hardware volume
     private var mutedByDevice: [String: Bool]
     private var appGains: [String: Float]        // app id → gain
     private var appMutedLevels: [String: Float]  // app id → level stashed while muted
     private var appNames: [String: String]       // app id → last seen display name
-    private var appKeys: [String: [String]]      // app id → driver client keys last seen
     private var previousTargets: [String] = []   // UIDs, most recent last
 
     /// App id → when it last produced a signal above `audibleThreshold`.
-    /// Every process that merely *opens* the device is a driver client —
-    /// corespeechd, callservicesd, loginwindow, Siri and a dozen other daemons
-    /// sit there permanently at digital silence. Only things actually making
-    /// sound belong in the menu, so an app has to have been audible recently to
-    /// be listed (starred apps are exempt).
+    /// Every process that merely *opens* a device has a tap — corespeechd,
+    /// callservicesd, loginwindow, Siri and a dozen other daemons sit there
+    /// permanently at digital silence. Only things actually making sound
+    /// belong in the menu, so an app has to have been audible recently to be
+    /// listed (starred apps are exempt).
     private var lastAudible: [String: Date] = [:]
     private let audibleThreshold: Float = 0.0003   // ≈ −70 dBFS
     private let audibleHold: TimeInterval = 8      // keep listed this long after it goes quiet
@@ -285,40 +234,30 @@ final class AudioRouter {
         static let appGains = "appGains"
         static let appMutedLevels = "appMutedLevels"
         static let appNames = "appNames"
-        static let appKeys = "appKeys"
         static let lastTarget = "lastTargetUID"
         static let previousTargets = "previousTargets"
         static let showMeters = "showMeters"
         static let showInputMeter = "showInputMeter"
-        static let routeBluetooth = "routeBluetoothThroughFaded"
         static let showInputSection = "showInputSection"
         static let hiddenOutputs = "hiddenOutputUIDs"
         static let hiddenInputs = "hiddenInputUIDs"
         static let starredApps = "starredApps"
-        static let engineMode = "engineMode"
     }
 
     init() {
         enabled = defaults.object(forKey: Keys.enabled) as? Bool ?? true
-        engineMode = EngineMode(rawValue: defaults.string(forKey: Keys.engineMode) ?? "") ?? .native
         showMeters = defaults.object(forKey: Keys.showMeters) as? Bool ?? true
         showInputMeter = defaults.bool(forKey: Keys.showInputMeter)   // opt-in: uses the mic
-        routeBluetoothThroughFaded = defaults.bool(forKey: Keys.routeBluetooth)
         showInputSection = defaults.object(forKey: Keys.showInputSection) as? Bool ?? true
         volumeByDevice = defaults.dictionary(forKey: Keys.volumeByDevice) as? [String: Float] ?? [:]
         mutedByDevice = defaults.dictionary(forKey: Keys.mutedByDevice) as? [String: Bool] ?? [:]
         appGains = defaults.dictionary(forKey: Keys.appGains) as? [String: Float] ?? [:]
         appMutedLevels = defaults.dictionary(forKey: Keys.appMutedLevels) as? [String: Float] ?? [:]
         appNames = defaults.dictionary(forKey: Keys.appNames) as? [String: String] ?? [:]
-        appKeys = defaults.dictionary(forKey: Keys.appKeys) as? [String: [String]] ?? [:]
         previousTargets = defaults.stringArray(forKey: Keys.previousTargets) ?? []
         hiddenOutputUIDs = Set(defaults.stringArray(forKey: Keys.hiddenOutputs) ?? [])
         hiddenInputUIDs = Set(defaults.stringArray(forKey: Keys.hiddenInputs) ?? [])
         starredApps = Set(defaults.stringArray(forKey: Keys.starredApps) ?? [])
-
-        driver.onClientsChanged = { [weak self] in self?.refreshApps() }
-        driver.onAvailabilityChanged = { [weak self] in self?.driverAvailabilityChanged() }
-        driverStatus = driver.status
 
         deviceListListener = AudioObject.listen(AudioSystem.object, .init(kAudioHardwarePropertyDevices)) { [weak self] in
             Task { @MainActor in self?.devicesChanged() }
@@ -335,6 +274,11 @@ final class AudioRouter {
             Task { @MainActor in self?.stopMetering() }
         }
 
+        // `--render-menu` / `--render-settings` only rasterise the UI from
+        // invented state; they must not touch devices, Bluetooth or the bridge.
+        let rendering = CommandLine.arguments.contains { $0.hasPrefix("--render-") }
+        guard !rendering else { return }
+
         bridge.onTabs = { [weak self] tabs in
             // Audible first, then anything holding a non-default setting.
             self?.browserTabs = tabs.sorted {
@@ -350,7 +294,7 @@ final class AudioRouter {
             self?.pushAllAppGains()
             self?.refreshApps()
         }
-        tapEngine.onOutputActivity = { [weak self] in self?.reconcileNativeIO() }
+        tapEngine.onOutputActivity = { [weak self] in self?.reconcileStream() }
         mediaKeys.onKey = { [weak self] key in self?.handleMediaKey(key) }
 
         refreshDevices()
@@ -378,103 +322,13 @@ final class AudioRouter {
     // MARK: Engage / disengage
 
     func engage() {
-        if isNative { engageNative(); return }
-        guard !isEngaged, driver.isReady, let faded = driver.outputDevice else {
-            driverStatus = driver.status
-            return
-        }
-        lastError = nil
-
-        let systemDefault = AudioSystem.defaultOutputDevice.flatMap(AudioDevice.init(id:))
-        let initial: AudioDevice? = if let d = systemDefault, !d.isFadedDevice, d.hasOutput {
-            d
-        } else if let uid = defaults.string(forKey: Keys.lastTarget), let d = allOutputs.first(where: { $0.uid == uid }) {
-            d
-        } else {
-            fallbackDevice()
-        }
-        guard let initialTarget = initial else {
-            lastError = "No output device to play to."
-            return
-        }
-
-        if initialTarget.transport == .bluetooth, !routeBluetoothThroughFaded,
-           AudioSystem.defaultOutputDevice == initialTarget.id {
-            standAside(for: initialTarget, reason: "bluetooth default at engage")
-            return
-        }
-
-        target = initialTarget
-        do {
-            try startEngine(for: initialTarget)
-        } catch {
-            lastError = "\(error)"
-            Self.log.error("engine start failed: \(String(describing: error))")
-            return
-        }
-        // Tested and settled: macOS refuses to use a device with
-        // kAudioDevicePropertyIsHidden set as the default output, so Faded is
-        // always visible. It reports the target's name instead (see
-        // driver.setDisplayName), which is what the volume HUD shows.
-        driver.setOutputHidden(false)
-        setSystemDefault(to: faded.id)
-        installFadedControlListeners()
-        installTargetListeners()
-        startHealthLogging()
-        driver.setDisplayName(initialTarget.name)
-        pushAllAppGains()
-        applyVolumeForTarget()
-        isEngaged = true
-        trace("engaged → \(initialTarget.name)")
-        installIdleRelease()
-        refreshApps()
-        Self.log.notice("engaged → \(initialTarget.name)")
-    }
-
-    func disengage(restoreDefault: Bool) {
-        disengage(restoreDefault: restoreDefault, mode: engineMode)
-    }
-
-    private func disengage(restoreDefault: Bool, mode: EngineMode) {
-        if mode == .native { disengageNative(); return }
-        guard isEngaged else { return }
-        healthTimer?.invalidate()
-        healthTimer = nil
-        engine.stop()
-        fadedControlListeners.removeAll()
-        targetControlListeners.removeAll()
-        targetRateListener = nil
-        fadedRateListener = nil
-        if restoreDefault, let t = target, t.isAlive {
-            setSystemDefault(to: t.id)
-        }
-        outputLevel = (0, 0)
-        isEngaged = false
-        fadedRunningListener = nil
-        idlePauseTimer?.invalidate()
-        idlePauseTimer = nil
-        // Nothing is being routed any more; stop impersonating a real device.
-        driver.setDisplayName(FadedProtocol.outputDeviceName)
-        Self.log.notice("disengaged")
-    }
-
-    /// Call from applicationWillTerminate.
-    func shutdown() {
-        bridge.stop()
-        inputMeter.stop()
-        mediaKeys.stop()
-        disengage(restoreDefault: true)
-    }
-
-    // MARK: Native engine (process taps)
-
-    private func engageNative() {
-        guard !isEngaged else { return }
+        guard !isEngaged, enabled else { return }
         lastError = nil
         var current = AudioSystem.defaultOutputDevice.flatMap(AudioDevice.init(id:))
-        // Coming from the virtual-device engine, the legacy device may still be
-        // the default; hand the system a real one first.
-        if current == nil || current!.isFadedDevice || !current!.hasOutput {
+        // The device the original driver-based engine published can still be
+        // the default on a machine that ran that version; hand the system a
+        // real one first.
+        if current == nil || current!.isLegacyFadedDevice || !current!.hasOutput {
             if let fb = fallbackDevice() { setSystemDefault(to: fb.id); current = fb }
         }
         guard let dev = current else { lastError = "No output device."; return }
@@ -483,71 +337,94 @@ final class AudioRouter {
             try tapEngine.start(output: dev)
         } catch {
             lastError = "\(error)"
-            trace("native engage failed: \(error)")
+            trace("engage failed on \(dev.name): \(error)")
             standAside(for: dev, reason: "tap engine failed")
             return
         }
-        if driver.isReady { driver.setOutputHidden(true) }   // no "Faded" device in menus
         steppedAside = false
         isEngaged = true
-        nativeStartFailures = 0
-        // App Nap would delay the listener that starts our stream when an
-        // app begins playing; that delay is audible silence.
+        startFailures = 0
+        // App Nap would delay the listener that starts our stream when an app
+        // begins playing; that delay is audible silence.
         if activity == nil {
             activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
                                                              reason: "Faded audio engine")
         }
         installTargetListeners()
-        applyVolumeForTargetNative()
+        applyVolumeForTarget()
         pushAllAppGains()
         updateMediaKeys()
-        startNativePolling()
+        startPolling()
         refreshApps()
-        reconcileNativeIO()
-        trace("native engaged → \(dev.name)")
+        reconcileStream()
+        trace("engaged → \(dev.name)")
     }
 
-    private func disengageNative() {
+    func disengage() {
         guard isEngaged else { return }
-        nativeStopWork?.cancel()
-        nativeStopWork = nil
+        stopWork?.cancel()
+        stopWork = nil
         if let a = activity { ProcessInfo.processInfo.endActivity(a); activity = nil }
         tapEngine.stop()
-        targetControlListeners.removeAll()
-        targetRateListener = nil
-        nativePollTimer?.invalidate()
-        nativePollTimer = nil
-        nativeIdlePaused = false
+        pollTimer?.invalidate()
+        pollTimer = nil
         mediaKeys.isActive = false
+        needsAccessibility = false
         outputLevel = (0, 0)
         isEngaged = false
-        trace("native disengaged")
+        readVolumeFromTargetDirectly()
+        trace("disengaged")
     }
 
+    /// Call from applicationWillTerminate.
+    func shutdown() {
+        bridge.stop()
+        inputMeter.stop()
+        mediaKeys.stop()
+        disengage()
+    }
+
+    /// The engine cannot run on this device. Track it for display only — the
+    /// header names it and the slider drives its hardware volume — and try
+    /// again when the default moves or after a pause.
+    private func standAside(for device: AudioDevice, reason: String) {
+        trace("standing aside for \(device.name) (\(reason))")
+        if isEngaged { disengage() }
+        steppedAside = true
+        target = device
+        retryAfter = Date().addingTimeInterval(30)
+        installTargetListeners()
+        readVolumeFromTargetDirectly()
+    }
+
+    // MARK: Following the system default
+
     /// The default moved (user, Control Center, AirPods, AirPlay): follow it.
-    /// Retries while a device is still materialising (AirPlay, Bluetooth).
-    private func followDefaultNative(_ id: AudioDeviceID, attempt: Int) {
+    /// Retries while a device is still materialising — an AirPlay device is
+    /// created in the same breath as it becomes the default, with no streams
+    /// configured yet, and Bluetooth takes seconds to bring its streams up.
+    private func followDefault(_ id: AudioDeviceID, attempt: Int) {
         followRetry?.cancel()
         followRetry = nil
         if let current = AudioSystem.defaultOutputDevice, current != id {
-            followDefaultNative(current, attempt: 0)
+            // Moved again mid-retry (AirPods connects flip it more than once).
+            followDefault(current, attempt: 0)
             return
         }
         let device = AudioDevice(id: id)
-        if let d = device, d.isFadedDevice {
-            // Someone picked the legacy virtual device; it plays to nothing now.
+        if let d = device, d.isLegacyFadedDevice {
             if let fb = fallbackDevice() { setSystemDefault(to: fb.id) }
             return
         }
         guard let dev = device, dev.hasOutput, dev.isAlive else {
             if attempt < 40 {
                 let work = DispatchWorkItem { [weak self] in
-                    Task { @MainActor in self?.followDefaultNative(id, attempt: attempt + 1) }
+                    Task { @MainActor in self?.followDefault(id, attempt: attempt + 1) }
                 }
                 followRetry = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
             } else {
-                trace("native: default \(id) never became usable")
+                trace("default \(id) never became usable")
             }
             return
         }
@@ -568,349 +445,76 @@ final class AudioRouter {
                 steppedAside = false
             } catch {
                 lastError = "\(error)"
-                trace("native retarget to \(dev.name) failed: \(error)")
-                steppedAside = true
+                trace("retarget to \(dev.name) failed: \(error)")
+                standAside(for: dev, reason: "retarget failed")
+                return
             }
-        } else if enabled {
-            engageNative()
-        }
-        nativeIdlePaused = false
-        applyVolumeForTargetNative()
-        updateMediaKeys()
-        reconcileNativeIO()
-        trace("native following → \(dev.name)")
-    }
-
-    private func applyVolumeForTargetNative() {
-        guard let t = target else { return }
-        if t.hasHardwareVolume {
-            volume = t.volume ?? 1
-            muted = t.isMuted ?? false
-            tapEngine.setMaster(1, muted: false)
-        } else {
-            volume = volumeByDevice[t.uid] ?? 1
-            muted = mutedByDevice[t.uid] ?? false
-            tapEngine.setMaster(volume, muted: muted)
-        }
-    }
-
-    // Volume keys are only intercepted on devices that have no volume of
-    // their own; everywhere else macOS handles them natively.
-    private func updateMediaKeys() {
-        let wants = isNative && isEngaged && (target.map { !$0.hasHardwareVolume } ?? false)
-        guard wants else {
-            mediaKeys.isActive = false
-            needsAccessibility = false
+        } else if enabled, Date() >= retryAfter {
+            engage()
             return
         }
-        if mediaKeys.start() {
-            mediaKeys.isActive = true
-            needsAccessibility = false
-        } else {
-            mediaKeys.isActive = false
-            needsAccessibility = true
+        applyVolumeForTarget()
+        updateMediaKeys()
+        reconcileStream()
+        trace("following → \(dev.name)")
+    }
+
+    private func defaultOutputChanged() {
+        guard !settingDefault else { return }
+        resolveDefaultChange(attempt: 0)
+    }
+
+    /// Reading kAudioHardwarePropertyDefaultOutputDevice from inside the HAL's
+    /// own change callback frequently returns kAudioObjectUnknown — the HAL is
+    /// mid-transaction. So the read is retried on a short timer until it answers.
+    private func resolveDefaultChange(attempt: Int) {
+        let current = AudioSystem.defaultOutputDevice
+        trace("resolveDefault attempt=\(attempt) current=\(current ?? 0)")
+        if let current, current != 0 {
+            followDefault(current, attempt: 0)
+            return
+        }
+        guard attempt < 20 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            Task { @MainActor in self?.resolveDefaultChange(attempt: attempt + 1) }
         }
     }
 
-    func requestAccessibility() {
-        MediaKeyTap.requestAccessibility()
-        // Grants arrive asynchronously through System Settings; poll briefly.
-        Task { @MainActor in
-            for _ in 0 ..< 60 {
-                try? await Task.sleep(for: .seconds(1))
-                if MediaKeyTap.hasAccessibility { updateMediaKeys(); break }
-            }
+    /// Watchdog for every way following can silently break: a change callback
+    /// whose read failed, a device that became usable after the retry window,
+    /// a stood-aside device that now works. Two cheap reads every three seconds.
+    private func startWatchdog() {
+        reconcileTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.watchdogTick() }
         }
     }
 
-    private func handleMediaKey(_ key: MediaKeyTap.Key) {
-        let step: Float = 1.0 / 16.0
-        switch key {
-        case .up: setVolume(min(1, (muted ? 0 : volume) + step))
-        case .down: setVolume(max(0, volume - step))
-        case .mute: setMuted(!muted)
-        }
-        hud.show(volume: volume, muted: muted, deviceName: target?.name ?? "")
-    }
-
-    /// One-second safety net behind the listeners: gather peaks for the
-    /// audible bookkeeping even with the menu closed, and re-check that our
-    /// stream state matches what the apps are doing.
-    private func startNativePolling() {
-        nativePollTimer?.invalidate()
-        lastSignal = Date()
-        nativePollTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.nativePoll() }
+    private func watchdogTick() {
+        guard enabled, !settingDefault, followRetry == nil,
+              let current = AudioSystem.defaultOutputDevice, current != 0 else { return }
+        let currentUID = AudioDevice(id: current)?.uid
+        if !isEngaged {
+            if Date() >= retryAfter { followDefault(current, attempt: 0) }
+        } else if currentUID != nil, currentUID != tapEngine.output?.uid {
+            followDefault(current, attempt: 0)
         }
     }
 
-    private var pollTicks = 0
-    private func nativePoll() {
-        guard isEngaged, isNative else { return }
-        pollEnginePeaks()
-        pollTicks += 1
-        if pollTicks % 10 == 0 {
-            let loudest = nativePeaks.values.max() ?? 0
-            trace("native: \(tapEngine.stats) loudest=\(loudest) output=\(target?.name ?? "-") idle=\(Int(Date().timeIntervalSince(lastSignal)))s")
-        }
-        if !menuPopoverIsVisible { nativePeaks.removeAll() }
-        reconcileNativeIO()
-    }
-
-    /// Our stream runs exactly while some app runs output — what macOS sees
-    /// natively. Stopping waits a moment so players that close and reopen
-    /// their stream between tracks don't make us flap.
-    private func reconcileNativeIO() {
-        guard isEngaged, isNative else { return }
-        let wanted = tapEngine.anyProcessRunningOutput
-        if wanted {
-            nativeStopWork?.cancel()
-            nativeStopWork = nil
-            guard !tapEngine.isRunning, Date() >= nativeRetryAfter else { return }
-            do {
-                try tapEngine.resumeIO()
-                nativeStartFailures = 0
-                nativeIdlePaused = false
-            } catch {
-                nativeStartFailures += 1
-                trace("native: stream start failed (\(nativeStartFailures)): \(error)")
-                if nativeStartFailures >= 3 {
-                    // Taps are muting everything and we cannot play it: get
-                    // out of the way so audio flows natively, try again later.
-                    trace("native: giving up for 30 s — audio back to macOS")
-                    nativeRetryAfter = Date().addingTimeInterval(30)
-                    tapEngine.stop()
-                    steppedAside = true
-                    isEngaged = false
-                    Task { @MainActor in
-                        try? await Task.sleep(for: .seconds(31))
-                        if self.enabled, self.isNative, !self.isEngaged { self.engageNative() }
-                    }
-                }
-            }
-        } else if tapEngine.isRunning, nativeStopWork == nil {
-            let work = DispatchWorkItem { [weak self] in
-                Task { @MainActor in
-                    guard let self, self.isEngaged, self.isNative else { return }
-                    self.nativeStopWork = nil
-                    if !self.tapEngine.anyProcessRunningOutput {
-                        self.tapEngine.pauseIO()
-                        self.nativeIdlePaused = true
-                    }
-                }
-            }
-            nativeStopWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
-        }
-    }
-
-    private func pollEnginePeaks() {
-        let fresh = tapEngine.takePeaks()
-        var anySignal = false
-        for (k, v) in fresh {
-            nativePeaks[k] = max(nativePeaks[k] ?? 0, v)
-            if v > audibleThreshold { anySignal = true }
-        }
-        if anySignal { lastSignal = Date() }
-    }
-
-    private func resolvedApp(for p: TappedProcess) -> ResolvedApp {
-        if let r = resolvedByProcess[p.id] { return r }
-        let r = ProcessResolver.resolve(pid: p.pid, bundleID: p.bundleID)
-        resolvedByProcess[p.id] = r
-        return r
-    }
-
-    /// Glitches that happen "sometimes" cannot be caught live, so the engine
-    /// leaves a trail: whenever a dropout or a resync actually occurs it is
-    /// logged at notice level (which persists), along with the state of the
-    /// drift loop at that moment. Afterwards,
-    ///   log show --predicate 'subsystem == "com.andri.faded"' --last 1h
-    /// answers what happened and when, instead of relying on someone noticing
-    /// a click and remembering what they were doing.
-    private func startHealthLogging() {
-        healthTimer?.invalidate()
-        lastHealth = (0, 0)
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.logHealth() }
-        }
-    }
-
-    private func logHealth() {
-        guard isEngaged else { return }
-        let e = engine.stats
-        guard e.underruns != lastHealth.under || e.resyncs != lastHealth.resync else { return }
-        let newUnder = e.underruns &- lastHealth.under
-        let newResync = e.resyncs &- lastHealth.resync
-        lastHealth = (e.underruns, e.resyncs)
-        let fill = Int(e.fill)
-        let ppm = Int(e.driftPPM)
-        Self.log.notice("audio dropout: \(newUnder) underrun(s), \(newResync) resync(s) — fill \(fill) frames, drift correction \(ppm) ppm")
-    }
-
-    // MARK: Idle release
-
-    /// The HAL flips kAudioDevicePropertyDeviceIsRunningSomewhere on the Faded
-    /// device the moment any app starts or stops doing I/O to it. Playing →
-    /// output opens immediately (the ring buffers the first frames, so nothing
-    /// is lost). Silent for ten seconds → the output stream is released, which
-    /// lets devices sleep and — the part that matters for AirPods — lets
-    /// Apple's automatic switching hand them back to the iPhone, which it will
-    /// never do while the Mac holds a stream open.
-    private func installIdleRelease() {
-        guard let faded = driver.outputDevice else { return }
-        fadedRunningListener = AudioObject.listen(faded.id,
-            .init(kAudioDevicePropertyDeviceIsRunningSomewhere)) { [weak self] in
-            Task { @MainActor in self?.producerRunningChanged() }
-        }
-        producerRunningChanged()
-    }
-
-    private func producerRunningChanged() {
-        guard isEngaged, let faded = driver.outputDevice else { return }
-        let running = (try? AudioObject.get(faded.id,
-            .init(kAudioDevicePropertyDeviceIsRunningSomewhere), as: UInt32.self)) ?? 0
-        trace("producerRunning=\(running)")
-        if running != 0 {
-            idlePauseTimer?.invalidate()
-            idlePauseTimer = nil
-            engine.resumeOutput()
-        } else if idlePauseTimer == nil {
-            idlePauseTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: false) { [weak self] _ in
-                Task { @MainActor in
-                    guard let self, self.isEngaged else { return }
-                    trace("idle 10 s — pausing output")
-                    self.engine.pauseOutput()
-                }
-            }
-        }
+    private func devicesChanged() {
+        refreshDevices()
+        // A vanished default makes macOS pick another; the change notification
+        // brings the engine along. Nothing else to do here.
     }
 
     // MARK: Output selection
 
+    /// The user picked a device in Faded's menu. The default is macOS's to
+    /// own; the change notification does the rest.
     func select(_ device: AudioDevice) {
-        guard device.hasOutput, !device.isFadedDevice else { return }
-        if isNative {
-            // The default is macOS's to own; the change notification follows.
-            setSystemDefault(to: device.id)
-            followDefaultNative(device.id, attempt: 0)
-            return
-        }
-        // Native Bluetooth mode: hand the device to macOS outright, whichever
-        // state we were in — same behaviour as an auto-switch landing on it.
-        if device.transport == .bluetooth, !routeBluetoothThroughFaded {
-            setSystemDefault(to: device.id)
-            standAside(for: device, reason: "selected in menu")
-            return
-        }
-        steppedAside = false
-        if !isEngaged {
-            if enabled, driver.isReady {
-                setSystemDefault(to: device.id)
-                target = device
-                engage()
-                return
-            }
-            setSystemDefault(to: device.id)
-            target = device
-            readVolumeFromTargetDirectly()
-            return
-        }
-        retarget(device)
+        guard device.hasOutput, !device.isLegacyFadedDevice else { return }
+        setSystemDefault(to: device.id)
+        followDefault(device.id, attempt: 0)
     }
-
-    private func retarget(_ device: AudioDevice) {
-        if let old = target, old.uid != device.uid {
-            previousTargets.removeAll { $0 == old.uid }
-            previousTargets.append(old.uid)
-            if previousTargets.count > 8 { previousTargets.removeFirst() }
-            defaults.set(previousTargets, forKey: Keys.previousTargets)
-        }
-        target = device
-        defaults.set(device.uid, forKey: Keys.lastTarget)
-        do {
-            let rate = engineRate(for: device)
-            if engine.isRunning, abs(engine.sampleRate - rate) < 1 {
-                try engine.retarget(output: device.id)
-            } else {
-                try startEngine(for: device)
-            }
-        } catch {
-            lastError = "\(error)"
-            Self.log.error("retarget failed: \(String(describing: error))")
-        }
-        installTargetListeners()
-        applyVolumeForTarget()
-        driver.setDisplayName(device.name)
-        trace("retarget complete → \(device.name); displayName sent")
-    }
-
-    private func startEngine(for device: AudioDevice) throws {
-        // Whatever rate the Faded device is currently running at is the rate
-        // the driver produces frames at. Follow it rather than imposing one —
-        // the output unit converts to the target device's own rate anyway.
-        let rate = driver.outputDevice?.nominalSampleRate ?? FadedProtocol.defaultSampleRate
-        try engine.start(output: device.id, sampleRate: rate > 0 ? rate : FadedProtocol.defaultSampleRate)
-    }
-
-    /// Run the virtual devices at the target's rate when we can, so nothing
-    /// resamples; otherwise 48 kHz and let AUHAL convert on the way out.
-    private func engineRate(for device: AudioDevice) -> Double {
-        let r = device.nominalSampleRate
-        return FadedProtocol.supportedSampleRates.contains(r) ? r : FadedProtocol.defaultSampleRate
-    }
-
-    private func fallbackDevice() -> AudioDevice? {
-        for uid in previousTargets.reversed() {
-            if let d = allOutputs.first(where: { $0.uid == uid }) { return d }
-        }
-        return allOutputs.first(where: { $0.transport == .builtIn }) ?? allOutputs.first
-    }
-
-    // MARK: Input selection
-
-    func selectInput(_ device: AudioDevice) {
-        guard device.hasInput else { return }
-        settingDefault = true
-        defer { settingDefault = false }
-        try? AudioSystem.setDefaultInputDevice(device.id)
-        selectedInput = device
-        installInputListeners()
-        readInputLevels()
-
-    }
-
-    func setInputVolume(_ v: Float) {
-        guard let i = selectedInput, i.hasInputVolume else { return }
-        let clamped = min(max(v, 0), 1)
-        i.setInputVolume(clamped)
-        inputVolume = clamped
-        if clamped > 0, inputMuted { setInputMuted(false) }
-    }
-
-    func setInputMuted(_ m: Bool) {
-        guard let i = selectedInput else { return }
-        i.setInputMuted(m)
-        inputMuted = m
-    }
-
-    private func readInputLevels() {
-        guard let i = selectedInput else { inputVolume = 1; inputMuted = false; return }
-        inputVolume = i.inputVolume ?? 1
-        inputMuted = i.isInputMuted ?? false
-    }
-
-    private func installInputListeners() {
-        inputControlListeners.removeAll()
-        guard let i = selectedInput else { return }
-        inputControlListeners = i.inputVolumeListenerAddresses.map { addr in
-            AudioObject.listen(i.id, addr) { [weak self] in
-                Task { @MainActor in self?.readInputLevels() }
-            }
-        }
-    }
-
-    // MARK: System default management
 
     private func setSystemDefault(to id: AudioDeviceID) {
         settingDefault = true
@@ -923,209 +527,18 @@ final class AudioRouter {
         }
     }
 
-    /// The system default output moved.
-    ///
-    /// Normally we adopt the new device as the play-to target and take the
-    /// default back, so everything keeps flowing through Faded.
-    ///
-    /// The subtle case is AirPlay. An AirPlay speaker is not a CoreAudio device
-    /// while it is idle — macOS *materialises* a device named "AirPlay" at the
-    /// instant you pick one, and makes it the default in the same breath. Its
-    /// streams are not configured yet when the notification arrives, so a
-    /// snapshot taken right now reports no output channels and it looks like
-    /// something we cannot play to. Standing down on that first look is what
-    /// made Faded miss AirPlay entirely; instead the device gets a few hundred
-    /// milliseconds to finish appearing before we give up on it.
-    private func defaultOutputChanged() {
-        guard !settingDefault else { return }
-        resolveDefaultChange(attempt: 0)
+    private func fallbackDevice() -> AudioDevice? {
+        for uid in previousTargets.reversed() {
+            if let d = allOutputs.first(where: { $0.uid == uid }) { return d }
+        }
+        return allOutputs.first(where: { $0.transport == .builtIn }) ?? allOutputs.first
     }
 
-    /// Reading kAudioHardwarePropertyDefaultOutputDevice from inside the HAL's
-    /// own change callback frequently returns kAudioObjectUnknown — the HAL is
-    /// mid-transaction. Trusting that read made the app deaf to device
-    /// switches whenever the timing was wrong (which for AirPods was nearly
-    /// always). So the read is retried on a short timer until the HAL answers.
-    private func resolveDefaultChange(attempt: Int) {
-        let current = AudioSystem.defaultOutputDevice
-        trace("resolveDefault attempt=\(attempt) current=\(current ?? 0)")
-        if isNative {
-            if let current, current != 0 { followDefaultNative(current, attempt: 0); return }
-        } else if let faded = driver.outputDevice {
-            if let current, current != 0 {
-                if current != faded.id { adopt(current, attempt: 0) }
-                return
-            }
-        } else {
-            return
-        }
-        guard attempt < 20 else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            Task { @MainActor in self?.resolveDefaultChange(attempt: attempt + 1) }
-        }
-    }
-
-    /// Adopt `deviceID` if we can play to it, retrying briefly while it settles.
-    private func adopt(_ deviceID: AudioDeviceID, attempt: Int) {
-        trace("adopt(\(deviceID), attempt \(attempt))")
-        guard let faded = driver.outputDevice else { return }
-        // The default moved again mid-retry (AirPods connects flip it more
-        // than once). Chase the new one rather than silently giving up.
-        if let current = AudioSystem.defaultOutputDevice, current != deviceID {
-            if current != faded.id { adopt(current, attempt: 0) }
-            return
-        }
-
-        let device = AudioDevice(id: deviceID)
-        let adoptable = device.map { $0.hasOutput && !$0.isFadedDevice && $0.isAlive } ?? false
-
-        if let d = device {
-            trace("adopt: adoptable=\(adoptable) name=\(d.name) hasOutput=\(d.hasOutput) alive=\(d.isAlive) isFaded=\(d.isFadedDevice) engaged=\(isEngaged)")
-        } else {
-            trace("adopt: device snapshot nil for \(deviceID)")
-        }
-        adoptRetry?.cancel()
-        adoptRetry = nil
-
-        // Native Bluetooth mode: a BT headset holding the default is the
-        // intended steady state, not something to fight — reclaiming it reads
-        // to Apple's auto-switch heuristics as the user rejecting the device.
-        if let d = device, d.transport == .bluetooth, !routeBluetoothThroughFaded {
-            standAside(for: d, reason: "bluetooth handled natively")
-            return
-        }
-
-        if adoptable, let device {
-            if isEngaged {
-                Self.log.info("system default moved to \(device.name) — following")
-                retarget(device)
-                setSystemDefault(to: faded.id)
-            } else if enabled, driver.isReady {
-                Self.log.info("adoptable device \(device.name) is default — engaging")
-                steppedAside = false
-                target = device
-                engage()
-            }
-            return
-        }
-
-        // Bluetooth audio takes seconds to bring its streams up, not the few
-        // hundred milliseconds AirPlay needs — a window that ends before the
-        // device is ready leaves Faded stood aside with no event to ever wake
-        // it (the default never changes again). Ten seconds covers AirPods
-        // reconnecting from an iPhone handoff.
-        if attempt < 40 {
-            adoptRetry?.cancel()
-            let work = DispatchWorkItem { [weak self] in
-                Task { @MainActor in self?.adopt(deviceID, attempt: attempt + 1) }
-            }
-            adoptRetry = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
-            return
-        }
-
-        // Genuinely cannot follow it. Let macOS route natively rather than
-        // fighting for the default and yanking playback away from the user.
-        guard isEngaged else { return }
-        standAside(for: device, reason: "not adoptable")
-    }
-
-    /// Faded gets out of the audio path entirely, tracking the device only for
-    /// display: the header names it, and the menu's slider drives its hardware
-    /// volume directly. Idempotent so the watchdog can call it every tick.
-    private func standAside(for device: AudioDevice?, reason: String) {
-        if steppedAside, target?.uid == device?.uid { return }
-        trace("standing aside for \(device?.name ?? "?") (\(reason))")
-        steppedAside = true
-        if isEngaged { disengage(restoreDefault: false) }
-        target = device
-        installTargetListeners()
-        readVolumeFromTargetDirectly()
-    }
-
-    /// Watchdog for every way routing can silently break: a change callback
-    /// whose read failed, a device that became adoptable after the retry
-    /// window, a stepped-aside AirPlay session ending, a stolen default. Two
-    /// cheap property reads every three seconds; acts only when the default
-    /// is a real device that is not Faded.
-    private func startWatchdog() {
-        reconcileTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.watchdogTick() }
-        }
-    }
-
-    private func watchdogTick() {
-        if isNative {
-            guard enabled, !settingDefault, followRetry == nil,
-                  let current = AudioSystem.defaultOutputDevice, current != 0 else { return }
-            let currentUID = AudioDevice(id: current)?.uid
-            if !isEngaged || (currentUID != nil && currentUID != tapEngine.output?.uid) {
-                followDefaultNative(current, attempt: 0)
-            }
-            return
-        }
-        guard enabled, driver.isReady, !settingDefault, adoptRetry == nil,
-              let faded = driver.outputDevice,
-              let current = AudioSystem.defaultOutputDevice, current != 0,
-              current != faded.id
-        else { return }
-        if !routeBluetoothThroughFaded, let dev = AudioDevice(id: current),
-           dev.transport == .bluetooth {
-            standAside(for: dev, reason: "watchdog")
-            return
-        }
-        trace("watchdog: default is \(current), not faded — adopting")
-        steppedAside = false
-        adopt(current, attempt: 0)
-    }
-
-    private func devicesChanged() {
-        refreshDevices()
-        driver.refresh()
-        driverStatus = driver.status
-        guard isEngaged else { return }
-        if isNative {
-            // A vanished default makes macOS pick another; the change
-            // notification brings us along. Nothing to do here.
-            return
-        }
-        if let t = target, !allOutputs.contains(where: { $0.uid == t.uid }) || !t.isAlive {
-            Self.log.info("target \(t.name) vanished")
-            if let fb = fallbackDevice() { retarget(fb) } else { disengage(restoreDefault: false) }
-        }
-    }
-
-    private func driverAvailabilityChanged() {
-        driverStatus = driver.status
-        if isNative {
-            if driver.isReady, isEngaged { driver.setOutputHidden(true) }
-            return
-        }
-
-        // coreaudiod restarted (driver reinstalled, or macOS restarted it on
-        // its own). Every handle we hold is stale: the audio unit is dead, and
-        // the shared-memory mapping points at the *previous* driver's segment,
-        // which was unlinked and will never be written to again. Nothing about
-        // that is visible as an error — the app would just play silence for
-        // ever while still believing it was engaged. Tear it all down and
-        // build it again.
-        if driver.driverWasReloaded, isEngaged {
-            Self.log.info("driver was reloaded — rebuilding the audio path")
-            disengage(restoreDefault: false)
-        }
-
-        if !driver.isReady, isEngaged {
-            disengage(restoreDefault: true)
-        } else if driver.isReady, enabled, !isEngaged {
-            engage()
-        }
-    }
+    // MARK: Devices
 
     func refreshDevices() {
         if previewMode { return }
-        allOutputs = AudioDevice.selectableOutputs()
-            .filter { !(isNative && $0.isFadedDevice) }
-            .sorted(by: Self.deviceOrder)
+        allOutputs = AudioDevice.selectableOutputs().sorted(by: Self.deviceOrder)
         let uids = allOutputs.map(\.uid)
         offlineBluetooth = BluetoothAudio.pairedAudioDevices()
             .filter { bt in !uids.contains { BluetoothAudio.matches(uid: $0, id: bt.id) } }
@@ -1144,13 +557,12 @@ final class AudioRouter {
             selectedInput = current
             installInputListeners()
             readInputLevels()
-
         }
     }
 
     /// Connect a paired-but-absent Bluetooth device — Control Center's move.
     /// The Bluetooth link comes up off-main; audio arriving shows up as a new
-    /// CoreAudio device, which is then routed like any other selection.
+    /// CoreAudio device, which is then selected like any other.
     func connectBluetooth(_ bt: PairedBluetoothDevice) {
         guard connectingBluetooth == nil else { return }
         connectingBluetooth = bt.id
@@ -1205,8 +617,6 @@ final class AudioRouter {
         return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
     }
 
-    // MARK: Device visibility
-
     func setOutputHidden(_ device: AudioDevice, _ hidden: Bool) {
         if hidden { hiddenOutputUIDs.insert(device.uid) } else { hiddenOutputUIDs.remove(device.uid) }
         defaults.set(Array(hiddenOutputUIDs), forKey: Keys.hiddenOutputs)
@@ -1217,162 +627,235 @@ final class AudioRouter {
         defaults.set(Array(hiddenInputUIDs), forKey: Keys.hiddenInputs)
     }
 
+    // MARK: Input selection
+
+    func selectInput(_ device: AudioDevice) {
+        guard device.hasInput else { return }
+        settingDefault = true
+        defer { settingDefault = false }
+        try? AudioSystem.setDefaultInputDevice(device.id)
+        selectedInput = device
+        installInputListeners()
+        readInputLevels()
+    }
+
+    func setInputVolume(_ v: Float) {
+        guard let i = selectedInput, i.hasInputVolume else { return }
+        let clamped = min(max(v, 0), 1)
+        i.setInputVolume(clamped)
+        inputVolume = clamped
+        if clamped > 0, inputMuted { setInputMuted(false) }
+    }
+
+    func setInputMuted(_ m: Bool) {
+        guard let i = selectedInput else { return }
+        i.setInputMuted(m)
+        inputMuted = m
+    }
+
+    private func readInputLevels() {
+        guard let i = selectedInput else { inputVolume = 1; inputMuted = false; return }
+        inputVolume = i.inputVolume ?? 1
+        inputMuted = i.isInputMuted ?? false
+    }
+
+    private func installInputListeners() {
+        inputControlListeners.removeAll()
+        guard let i = selectedInput else { return }
+        inputControlListeners = i.inputVolumeListenerAddresses.map { addr in
+            AudioObject.listen(i.id, addr) { [weak self] in
+                Task { @MainActor in self?.readInputLevels() }
+            }
+        }
+    }
+
     // MARK: Output volume
 
     func setVolume(_ v: Float) {
         let clamped = min(max(v, 0), 1)
-        if isNative {
-            guard let t = target else { return }
-            if t.hasHardwareVolume {
-                t.setVolume(clamped)
-            } else {
-                volumeByDevice[t.uid] = clamped
-                defaults.set(volumeByDevice, forKey: Keys.volumeByDevice)
-                tapEngine.setMaster(clamped, muted: false)
-            }
-            volume = clamped
-            if muted { setMuted(false) }
-            return
-        }
-        if isEngaged {
-            driver.setFadedVolume(clamped) // listener mirrors to target + persists
-            if clamped > 0, muted { setMuted(false) }
-        } else if let t = target {
+        guard let t = target else { return }
+        if t.hasHardwareVolume {
             t.setVolume(clamped)
-            volume = clamped
+        } else if isEngaged {
+            volumeByDevice[t.uid] = clamped
+            defaults.set(volumeByDevice, forKey: Keys.volumeByDevice)
+            tapEngine.setMaster(clamped, muted: false)
+        } else {
+            return   // nothing can apply it
         }
+        volume = clamped
+        if muted { setMuted(false) }
     }
 
     func setMuted(_ m: Bool) {
-        if isNative {
-            guard let t = target else { return }
-            if t.hasHardwareMute {
-                t.setMuted(m)
-            } else {
-                mutedByDevice[t.uid] = m
-                defaults.set(mutedByDevice, forKey: Keys.mutedByDevice)
-                tapEngine.setMaster(volume, muted: m)
-            }
-            muted = m
+        guard let t = target else { return }
+        if t.hasHardwareMute {
+            t.setMuted(m)
+        } else if isEngaged {
+            mutedByDevice[t.uid] = m
+            defaults.set(mutedByDevice, forKey: Keys.mutedByDevice)
+            tapEngine.setMaster(volume, muted: m)
+        } else {
             return
         }
-        if isEngaged {
-            driver.setFadedMuted(m)
-        } else if let t = target {
-            t.setMuted(m)
-            muted = m
+        muted = m
+    }
+
+    /// Seed the slider and the engine's master gain for the current device.
+    private func applyVolumeForTarget() {
+        guard let t = target else { return }
+        if t.hasHardwareVolume {
+            volume = t.volume ?? 1
+            muted = t.isMuted ?? false
+            tapEngine.setMaster(1, muted: false)
+        } else {
+            volume = volumeByDevice[t.uid] ?? 1
+            muted = mutedByDevice[t.uid] ?? false
+            tapEngine.setMaster(volume, muted: muted)
         }
     }
 
-    /// Not engaged: the top slider just shows/drives the real device.
+    /// Not engaged: the slider just shows/drives the real device.
     private func readVolumeFromTargetDirectly() {
         guard !isEngaged, let t = target else { return }
         volume = t.volume ?? 1
         muted = t.isMuted ?? false
     }
 
-    /// The Faded control (moved by keys / Sound slider / our UI) changed → mirror.
-    private func fadedControlChanged() {
-        guard isEngaged, !syncingVolume, let t = target else { return }
-        syncingVolume = true
-        defer { syncingVolume = false }
-        let v = driver.fadedVolume
-        let m = driver.fadedMuted
-        volume = v
-        muted = m
-        volumeByDevice[t.uid] = v
-        mutedByDevice[t.uid] = m
-        defaults.set(volumeByDevice, forKey: Keys.volumeByDevice)
-        defaults.set(mutedByDevice, forKey: Keys.mutedByDevice)
-        if t.hasHardwareVolume { t.setVolume(v) }
-        if t.hasHardwareMute { t.setMuted(m) }
-    }
-
-    /// The *target's* hardware volume changed elsewhere (AirPods stem, another
-    /// app) → reflect it on the Faded control so the two never disagree.
+    /// The device's own volume changed elsewhere (AirPods stem, Control
+    /// Center, another app) → reflect it.
     private func targetControlChanged() {
-        guard !syncingVolume, let t = target else { return }
-        if isNative {
-            if t.hasHardwareVolume, let v = t.volume { volume = v }
-            if t.hasHardwareMute, let m = t.isMuted { muted = m }
-            return
-        }
-        guard isEngaged else {
-            // Standing aside: just reflect the device's own level in the menu.
-            if let v = t.volume { volume = v }
-            if let m = t.isMuted { muted = m }
-            return
-        }
-        guard t.hasHardwareVolume else { return }
-        syncingVolume = true
-        defer { syncingVolume = false }
-        if let v = t.volume { driver.setFadedVolume(v); volume = v; volumeByDevice[t.uid] = v }
-        if let m = t.isMuted { driver.setFadedMuted(m); muted = m; mutedByDevice[t.uid] = m }
-    }
-
-    /// New target: decide who owns the gain stage and seed the Faded control.
-    private func applyVolumeForTarget() {
         guard let t = target else { return }
-        driver.setBypassMaster(t.hasHardwareVolume)
-        syncingVolume = true
-        let v: Float = t.hasHardwareVolume ? (t.volume ?? 1) : (volumeByDevice[t.uid] ?? 1)
-        let m: Bool = t.hasHardwareMute ? (t.isMuted ?? false) : (mutedByDevice[t.uid] ?? false)
-        driver.setFadedVolume(v)
-        driver.setFadedMuted(m)
-        volume = v
-        muted = m
-        syncingVolume = false
-    }
-
-    private func installFadedControlListeners() {
-        guard let faded = driver.outputDevice else { return }
-        fadedControlListeners = faded.volumeListenerAddresses.map { addr in
-            AudioObject.listen(faded.id, addr) { [weak self] in
-                Task { @MainActor in self?.fadedControlChanged() }
-            }
-        }
-        // coreaudiod re-rates the Faded device to suit its clients — open a
-        // 44.1 kHz track and the device follows it. The driver then produces
-        // frames at that rate, so the play-through has to be reopened to match
-        // or it drains the ring at the wrong speed and glitches continuously.
-        fadedRateListener = AudioObject.listen(faded.id, .init(kAudioDevicePropertyNominalSampleRate)) { [weak self] in
-            Task { @MainActor in self?.fadedRateChanged() }
-        }
-    }
-
-    private func fadedRateChanged() {
-        guard isEngaged, let t = target, let faded = driver.outputDevice else { return }
-        let rate = faded.nominalSampleRate
-        guard rate > 0, abs(rate - engine.sampleRate) >= 1 else { return }
-        Self.log.info("Faded device re-rated to \(rate) — reopening play-through")
-        do {
-            try engine.start(output: t.id, sampleRate: rate)
-        } catch {
-            lastError = "\(error)"
-            Self.log.error("reopen after rate change failed: \(String(describing: error))")
-        }
+        if t.hasHardwareVolume, let v = t.volume { volume = v }
+        if t.hasHardwareMute, let m = t.isMuted { muted = m }
     }
 
     private func installTargetListeners() {
         targetControlListeners.removeAll()
-        targetRateListener = nil
         guard let t = target else { return }
         targetControlListeners = t.volumeListenerAddresses.map { addr in
             AudioObject.listen(t.id, addr) { [weak self] in
                 Task { @MainActor in self?.targetControlChanged() }
             }
         }
-        targetRateListener = AudioObject.listen(t.id, .init(kAudioDevicePropertyNominalSampleRate)) { [weak self] in
-            Task { @MainActor in self?.targetRateChanged() }
+    }
+
+    // MARK: Volume keys
+
+    /// Volume keys are only intercepted on devices that have no volume of
+    /// their own; everywhere else macOS handles them natively.
+    private func updateMediaKeys() {
+        let wants = isEngaged && (target.map { !$0.hasHardwareVolume } ?? false)
+        guard wants else {
+            mediaKeys.isActive = false
+            needsAccessibility = false
+            return
+        }
+        if mediaKeys.start() {
+            mediaKeys.isActive = true
+            needsAccessibility = false
+        } else {
+            mediaKeys.isActive = false
+            needsAccessibility = true
         }
     }
 
-    private func targetRateChanged() {
-        guard isEngaged, !isNative, let t = target else { return }
-        let rate = engineRate(for: t)
-        guard abs(rate - engine.sampleRate) >= 1 else { return }
-        Self.log.info("target rate → \(rate), restarting engine")
-        do { try startEngine(for: t) } catch { lastError = "\(error)" }
+    func requestAccessibility() {
+        MediaKeyTap.requestAccessibility()
+        // Grants arrive asynchronously through System Settings; poll briefly.
+        Task { @MainActor in
+            for _ in 0 ..< 60 {
+                try? await Task.sleep(for: .seconds(1))
+                if MediaKeyTap.hasAccessibility { updateMediaKeys(); break }
+            }
+        }
+    }
+
+    private func handleMediaKey(_ key: MediaKeyTap.Key) {
+        let step: Float = 1.0 / 16.0
+        switch key {
+        case .up: setVolume(min(1, (muted ? 0 : volume) + step))
+        case .down: setVolume(max(0, volume - step))
+        case .mute: setMuted(!muted)
+        }
+        hud.show(volume: volume, muted: muted, deviceName: target?.name ?? "")
+    }
+
+    // MARK: The engine's stream
+
+    /// One-second safety net behind the listeners: gather peaks for the
+    /// audible bookkeeping even with the menu closed, and re-check that our
+    /// stream state matches what the apps are doing.
+    private func startPolling() {
+        pollTimer?.invalidate()
+        lastSignal = Date()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.poll() }
+        }
+    }
+
+    private func poll() {
+        guard isEngaged else { return }
+        pollEnginePeaks()
+        pollTicks += 1
+        if pollTicks % 10 == 0 {
+            let loudest = peaksByProcess.values.max() ?? 0
+            trace("engine: \(tapEngine.stats) loudest=\(loudest) output=\(target?.name ?? "-") idle=\(Int(Date().timeIntervalSince(lastSignal)))s")
+        }
+        if !menuPopoverIsVisible { peaksByProcess.removeAll() }
+        reconcileStream()
+    }
+
+    /// Our stream runs exactly while some app runs output — what macOS sees
+    /// natively. Stopping waits a moment so players that close and reopen
+    /// their stream between tracks don't make us flap.
+    private func reconcileStream() {
+        guard isEngaged else { return }
+        let wanted = tapEngine.anyProcessRunningOutput
+        if wanted {
+            stopWork?.cancel()
+            stopWork = nil
+            guard !tapEngine.isRunning, Date() >= retryAfter else { return }
+            do {
+                try tapEngine.resumeIO()
+                startFailures = 0
+            } catch {
+                startFailures += 1
+                trace("stream start failed (\(startFailures)): \(error)")
+                if startFailures >= 3, let t = target {
+                    // Taps are muting everything and we cannot play it: get
+                    // out of the way so audio flows natively, try again later.
+                    standAside(for: t, reason: "stream will not start")
+                }
+            }
+        } else if tapEngine.isRunning, stopWork == nil {
+            let work = DispatchWorkItem { [weak self] in
+                Task { @MainActor in
+                    guard let self, self.isEngaged else { return }
+                    self.stopWork = nil
+                    if !self.tapEngine.anyProcessRunningOutput { self.tapEngine.pauseIO() }
+                }
+            }
+            stopWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
+        }
+    }
+
+    private func pollEnginePeaks() {
+        let fresh = tapEngine.takePeaks()
+        var anySignal = false
+        for (k, v) in fresh {
+            peaksByProcess[k] = max(peaksByProcess[k] ?? 0, v)
+            if v > audibleThreshold { anySignal = true }
+        }
+        if anySignal { lastSignal = Date() }
+    }
+
+    private func resolvedApp(for p: TappedProcess) -> ResolvedApp {
+        if let r = resolvedByProcess[p.id] { return r }
+        let r = ProcessResolver.resolve(pid: p.pid, bundleID: p.bundleID)
+        resolvedByProcess[p.id] = r
+        return r
     }
 
     // MARK: Per-app volume
@@ -1382,38 +865,18 @@ final class AudioRouter {
         var byApp: [String: AppEntry] = [:]
         var playingOrder: [String] = []
 
-        if isNative {
-            for p in tapEngine.processes {
-                let app = resolvedApp(for: p)
-                appNames[app.id] = app.name
-                let peak = nativePeaks[p.id] ?? 0
-                if var e = byApp[app.id] {
-                    e.peak = max(e.peak, peak)
-                    byApp[app.id] = e
-                } else {
-                    byApp[app.id] = AppEntry(id: app.id, name: app.name, pid: app.pid,
-                                             gain: appGains[app.id] ?? 1,
-                                             muted: appMutedLevels[app.id] != nil,
-                                             peak: peak, keys: [], isBare: app.isBare,
-                                             starred: starredApps.contains(app.id), isPlaying: true)
-                    playingOrder.append(app.id)
-                }
-            }
-        }
-
-        for c in isNative ? [] : driver.clients() {
-            if c.pid == ProcessInfo.processInfo.processIdentifier { continue } // ourselves
-            let app = ProcessResolver.resolve(pid: c.pid, bundleID: c.bundleID)
+        for p in tapEngine.processes {
+            let app = resolvedApp(for: p)
             appNames[app.id] = app.name
+            let peak = peaksByProcess[p.id] ?? 0
             if var e = byApp[app.id] {
-                e.keys.insert(c.key)
-                e.peak = max(e.peak, c.peak)
+                e.peak = max(e.peak, peak)
                 byApp[app.id] = e
             } else {
                 byApp[app.id] = AppEntry(id: app.id, name: app.name, pid: app.pid,
                                          gain: appGains[app.id] ?? 1,
                                          muted: appMutedLevels[app.id] != nil,
-                                         peak: c.peak, keys: [c.key], isBare: app.isBare,
+                                         peak: peak, isBare: app.isBare,
                                          starred: starredApps.contains(app.id), isPlaying: true)
                 playingOrder.append(app.id)
             }
@@ -1433,61 +896,29 @@ final class AudioRouter {
             var e = e; e.isPlaying = false; byApp[id] = e
         }
 
-        // Starred apps stay in the list even when they're silent or not running,
-        // so their level can be set before they make a sound.
+        // Starred apps stay in the list even when they're silent or not
+        // running, so their level can be set before they make a sound.
         for id in starredApps where byApp[id] == nil {
             let name = appNames[id] ?? ProcessResolver.staticInfo(bundleID: id)?.name ?? id
             byApp[id] = AppEntry(id: id, name: name, pid: 0,
                                  gain: appGains[id] ?? 1,
                                  muted: appMutedLevels[id] != nil,
-                                 peak: 0, keys: Set(appKeys[id] ?? []), isBare: id.hasPrefix("pid:"),
+                                 peak: 0, isBare: id.hasPrefix("pid:"),
                                  starred: true, isPlaying: false)
         }
-
-        // Remember each app's driver keys so a stored gain can be pushed before
-        // the app next opens the device.
-        for (id, e) in byApp where !e.keys.isEmpty { appKeys[id] = Array(e.keys) }
         defaults.set(appNames, forKey: Keys.appNames)
-        defaults.set(appKeys, forKey: Keys.appKeys)
 
         let starred = byApp.values.filter(\.starred).sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         let rest = playingOrder.compactMap { byApp[$0] }.filter { !$0.starred }
         apps = starred + rest
-
-        pushAllAppGains()
     }
 
-    /// Ensure the driver's key→gain map reflects the stored per-app gains.
+    /// Push every process's gain to the engine from the stored per-app levels.
     private func pushAllAppGains() {
-        if isNative {
-            for p in tapEngine.processes {
-                let id = resolvedApp(for: p).id
-                tapEngine.setGain(forProcess: p.id, appMutedLevels[id] != nil ? 0 : (appGains[id] ?? 1))
-            }
-            return
+        for p in tapEngine.processes {
+            let id = resolvedApp(for: p).id
+            tapEngine.setGain(forProcess: p.id, appMutedLevels[id] != nil ? 0 : (appGains[id] ?? 1))
         }
-        guard driver.isReady else { return }
-        var map: [String: Float] = [:]
-
-        func gain(for id: String) -> Float {
-            appMutedLevels[id] != nil ? 0 : (appGains[id] ?? 1)
-        }
-        // Live entries: use the keys the driver actually reported.
-        for e in apps {
-            let g = gain(for: e.id)
-            guard g != 1 else { continue }
-            for k in e.keys { map[k] = g }
-        }
-        // Anything with a stored non-unity gain: push under its remembered keys
-        // (and its own id, which doubles as the key for non-helper apps) so the
-        // setting applies the moment it starts playing.
-        for id in Set(appGains.keys).union(appMutedLevels.keys) {
-            let g = gain(for: id)
-            guard g != 1 else { continue }
-            if !id.hasPrefix("pid:") { map[id] = g }
-            for k in appKeys[id] ?? [] { map[k] = g }
-        }
-        if map != driver.appGains() { driver.setAppGains(map) }
     }
 
     func setAppGain(_ appID: String, _ gain: Float) {
@@ -1532,7 +963,7 @@ final class AudioRouter {
                                                    pid: 0,
                                                    gain: appGains[id] ?? 1,
                                                    muted: appMutedLevels[id] != nil,
-                                                   peak: 0, keys: Set(appKeys[id] ?? []),
+                                                   peak: 0,
                                                    isBare: id.hasPrefix("pid:"),
                                                    starred: starredApps.contains(id), isPlaying: false)
         }
@@ -1542,14 +973,13 @@ final class AudioRouter {
     func forgetApp(_ appID: String) {
         appGains[appID] = nil
         appMutedLevels[appID] = nil
-        appKeys[appID] = nil
         appNames[appID] = nil
         starredApps.remove(appID)
         persistApps()
         defaults.set(Array(starredApps), forKey: Keys.starredApps)
         defaults.set(appNames, forKey: Keys.appNames)
-        defaults.set(appKeys, forKey: Keys.appKeys)
         refreshApps()
+        pushAllAppGains()
     }
 
     private func persistApps() {
@@ -1615,45 +1045,17 @@ final class AudioRouter {
         }
 
         guard isEngaged else { outputLevel = (0, 0); return }
-        if isNative {
-            tickMetersNative()
-            return
-        }
-        outputLevel = engine.outputPeak
-
-        let clients = driver.clients()
-        var peakByKey: [String: Float] = [:]
-        for c in clients { peakByKey[c.key] = max(peakByKey[c.key] ?? 0, c.peak) }
-        for i in apps.indices {
-            apps[i].peak = apps[i].keys.reduce(0) { max($0, peakByKey[$1] ?? 0) }
-        }
-
-        // Did anything start or stop being audible? Only then rebuild the list.
-        let now = Date()
-        let before = Set(apps.map(\.id))
-        var changed = false
-        for c in clients where c.peak > audibleThreshold {
-            let id = ProcessResolver.resolve(pid: c.pid, bundleID: c.bundleID).id
-            if lastAudible[id] == nil || !before.contains(id) { changed = true }
-            lastAudible[id] = now
-        }
-        if !changed {
-            changed = apps.contains { !$0.starred && (lastAudible[$0.id].map { now.timeIntervalSince($0) >= audibleHold } ?? true) }
-        }
-        if changed { refreshApps() }
-    }
-
-    private func tickMetersNative() {
         outputLevel = tapEngine.takeOutputPeak()
         pollEnginePeaks()
         var peakByApp: [String: Float] = [:]
         for p in tapEngine.processes {
             let id = resolvedApp(for: p).id
-            peakByApp[id] = max(peakByApp[id] ?? 0, nativePeaks[p.id] ?? 0)
+            peakByApp[id] = max(peakByApp[id] ?? 0, peaksByProcess[p.id] ?? 0)
         }
-        nativePeaks.removeAll()
+        peaksByProcess.removeAll()
         for i in apps.indices { apps[i].peak = peakByApp[apps[i].id] ?? 0 }
 
+        // Did anything start or stop being audible? Only then rebuild the list.
         let now = Date()
         let before = Set(apps.map(\.id))
         var changed = false
@@ -1668,25 +1070,29 @@ final class AudioRouter {
     }
 
 #if DEBUG
-    /// Fills in the parts of the menu that need a working driver so the layout
-    /// can be rendered and reviewed without installing anything.
+    /// Fills in the parts of the menu that need a running engine so the layout
+    /// can be rendered and reviewed without touching the audio system.
     /// `demo: true` also swaps in invented devices, so the README screenshot
     /// doesn't leak the device names of whatever machine generated it.
     /// Used by `--render-menu`; never reachable in a Release build.
     func applyPreviewState(demo: Bool = false) {
         previewMode = true
-        driverStatus = .ready
         isEngaged = true
         volume = 0.55
         outputLevel = (0.42, 0.51)
         apps = [
             AppEntry(id: "com.spotify.client", name: "Spotify", pid: 0, gain: 0.65, muted: false,
-                     peak: 0.5, keys: [], isBare: false, starred: true, isPlaying: true),
+                     peak: 0.5, isBare: false, starred: true, isPlaying: true),
             AppEntry(id: "com.hnc.Discord", name: "Discord", pid: 0, gain: 1, muted: false,
-                     peak: 0.12, keys: [], isBare: false, starred: true, isPlaying: true),
+                     peak: 0.12, isBare: false, starred: true, isPlaying: true),
             AppEntry(id: "com.apple.Safari", name: "Safari", pid: 0, gain: 0.4, muted: true,
-                     peak: 0, keys: [], isBare: false, starred: false, isPlaying: true),
+                     peak: 0, isBare: false, starred: false, isPlaying: true),
         ]
+        browserTabs = [
+            BrowserTab(id: 1, title: "Lofi hip hop radio — beats to relax/study to", gain: 0.5, audible: true, muted: false),
+            BrowserTab(id: 2, title: "Some podcast I keep open", gain: 1, audible: true, muted: false),
+        ]
+        browserBridgeConnected = true
         if demo {
             allOutputs = [
                 AudioDevice(demoID: 1, uid: "d1", name: "MacBook Pro Speakers", transport: .builtIn,
@@ -1716,18 +1122,13 @@ final class AudioRouter {
     // MARK: Diagnostics
 
     var diagnostics: String {
-        var s = "engine: \(engineMode)  driver: \(driverStatus)  enabled: \(enabled)\n"
-        s += "tap engine: \(tapEngine.stats) idlePaused=\(nativeIdlePaused) accessibility=\(MediaKeyTap.hasAccessibility)\n"
-        let ringRate: String = engine.reader.sampleRate.map { "\($0)" } ?? "-"
-        s += "shared ring open: \(engine.reader.isOpen)  ring rate: \(ringRate)\n"
-        s += "engaged: \(isEngaged)  output: \(target?.name ?? "-")  input: \(selectedInput?.name ?? "-")\n"
-        s += "output has hw volume: \(target?.hasHardwareVolume ?? false) (false ⇒ Faded applies it in software)\n"
-        let e = engine.stats
-        s += "engine: rate=\(engine.sampleRate) under=\(e.underruns) resync=\(e.resyncs) over=\(e.overruns) producing=\(e.producing)\n"
-        s += String(format: "drift loop: fill=%.0f frames (target %.0f) correction=%+.0f ppm\n",
-                    e.fill, engine.reader.target, e.driftPPM)
-        for (k, v) in driver.stats().sorted(by: { $0.key < $1.key }) { s += "\(k)=\(v) " }
-        if let err = lastError { s += "\nlast error: \(err)" }
+        var s = "enabled: \(enabled)  engaged: \(isEngaged)  steppedAside: \(steppedAside)\n"
+        s += "output: \(target?.name ?? "-")  hw volume: \(target?.hasHardwareVolume ?? false) (false ⇒ software master gain)\n"
+        s += "input: \(selectedInput?.name ?? "-")\n"
+        s += "engine: \(tapEngine.stats)\n"
+        s += "accessibility: \(MediaKeyTap.hasAccessibility)  bridge: \(browserBridgeConnected ? "connected" : "not connected")\n"
+        s += "legacy driver installed: \(LegacyDriver.isInstalled)\n"
+        if let err = lastError { s += "last error: \(err)" }
         return s
     }
 }

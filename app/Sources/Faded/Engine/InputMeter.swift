@@ -19,7 +19,7 @@ import Foundation
 import os
 
 final class InputMeter: @unchecked Sendable {
-    private static let log = Logger(subsystem: FadedProtocol.appBundleID, category: "InputMeter")
+    private static let log = Logger(subsystem: Faded.bundleID, category: "InputMeter")
 
     private var unit: AudioUnit?
     private var bufferList: UnsafeMutableAudioBufferListPointer?

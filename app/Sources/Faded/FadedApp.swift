@@ -31,7 +31,6 @@ private struct MenuBarLabel: View {
     }
 
     private var symbol: String {
-        if !router.isAudioReady { return "speaker.badge.exclamationmark" }
         if router.muted || router.volume <= 0.001 { return "speaker.slash" }
         if router.volume < 0.34 { return "speaker.wave.1" }
         if router.volume < 0.67 { return "speaker.wave.2" }
@@ -79,8 +78,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 #if DEBUG
         // `Faded --render-menu <out.png> [--expanded]` renders the popover to a
-        // file and quits, so the layout can be reviewed without installing the
-        // driver or touching the audio system. Debug builds only.
+        // file and quits, so the layout can be reviewed without touching the
+        // audio system. Debug builds only.
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--render-menu"), i + 1 < args.count {
             renderMenu(to: args[i + 1], expanded: args.contains("--expanded"), demo: args.contains("--demo"))
@@ -115,7 +114,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     private func renderMenu(to path: String, expanded: Bool, demo: Bool = false) {
         router.applyPreviewState(demo: demo)
+        // fixedSize: ImageRenderer otherwise proposes a bounded height and the
+        // menu, which is taller than that with the Apps and tabs open, gets
+        // cropped top and bottom.
         let view = MenuView(router: router, previewExpandApps: expanded)
+            .fixedSize(horizontal: false, vertical: true)
             .padding(6)
             .background(.background)
             .environment(\.colorScheme, .dark)
@@ -178,8 +181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Give macOS its default output back so audio doesn't dead-end in the
-        // driver when we're not running.
+        // Drop the taps so every app plays straight to its device again.
         router.shutdown()
     }
 

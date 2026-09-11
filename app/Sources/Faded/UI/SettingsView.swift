@@ -47,6 +47,7 @@ private struct GeneralSettings: View {
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var message: String?
     @State private var showDiagnostics = false
+    @State private var legacyInstalled = LegacyDriver.isInstalled
 
     var body: some View {
         Form {
@@ -62,27 +63,14 @@ private struct GeneralSettings: View {
                     }
                 Toggle("Per-app volume and volume keys", isOn: $router.enabled)
                 Text(router.enabled
-                     ? "Volume keys work on every device, and each app gets its own level."
+                     ? "Each app gets its own level, and the volume keys work on devices that have no volume control of their own. Your real device stays the system output, so AirPods switching, ear detection, AirPlay and Control Center behave exactly as without Faded."
                      : "Faded is passive: macOS handles audio exactly as it would without it.")
                     .font(.caption).foregroundStyle(.secondary)
-                Picker("Engine", selection: $router.engineMode) {
-                    Text("Native (recommended)").tag(AudioRouter.EngineMode.native)
-                    Text("Virtual device").tag(AudioRouter.EngineMode.virtualDevice)
-                }
-                Text(router.isNative
-                     ? "Native taps each app's audio and plays it back at the level you set, while your real device stays the system output — AirPods switching, ear detection, AirPlay and Control Center all behave exactly as without Faded. Needs the System Audio Recording permission once; nothing is recorded."
-                     : "The virtual device puts Faded in front of the system output. It needs the audio driver, and it takes the default device away from macOS, which breaks AirPods automatic switching.")
-                    .font(.caption).foregroundStyle(.secondary)
-                if !router.isNative {
-                    Toggle("Also route Bluetooth headphones through Faded", isOn: $router.routeBluetoothThroughFaded)
-                }
-                if router.isNative {
-                    LabeledContent("Volume keys on devices without volume") {
-                        if MediaKeyTap.hasAccessibility {
-                            Label("Accessibility allowed", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                        } else {
-                            Button("Allow in Accessibility…") { router.requestAccessibility() }
-                        }
+                LabeledContent("Volume keys on devices without volume") {
+                    if MediaKeyTap.hasAccessibility {
+                        Label("Accessibility allowed", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                    } else {
+                        Button("Allow in Accessibility…") { router.requestAccessibility() }
                     }
                 }
             } header: { Text("Behaviour") }
@@ -96,34 +84,20 @@ private struct GeneralSettings: View {
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Menu") }
 
-            Section {
-                if router.isNative {
-                    Text("Not needed by the native engine. Uninstall it if you don't plan to switch back.")
+            if legacyInstalled {
+                Section {
+                    Text("An older Faded installed an audio driver. This version doesn't use it, and it leaves a “Faded” device in Control Center that plays to nothing. Removing it asks for your password once and restarts the audio system (about a second of silence).")
                         .font(.caption).foregroundStyle(.secondary)
-                }
-                LabeledContent("Status") {
-                    switch router.driverStatus {
-                    case .ready: Label("Installed and running", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                    case .notInstalled: Label("Not installed", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                    case let .incompatible(v): Label("Needs updating (v\(v))", systemImage: "arrow.triangle.2.circlepath").foregroundStyle(.orange)
-                    }
-                }
+                    Button("Remove Old Driver…") { removeLegacyDriver() }
+                } header: { Text("Old audio driver") }
+            }
+
+            Section {
                 HStack {
-                    if router.driverStatus == .ready {
-                        Button("Reinstall…") { run { try DriverInstaller.install() } }
-                        Button("Uninstall…") {
-                            router.disengage(restoreDefault: true)
-                            run { try DriverInstaller.uninstall() }
-                        }
-                    } else {
-                        Button("Install Driver…") { run { try DriverInstaller.install() } }
-                            .buttonStyle(.borderedProminent)
-                    }
-                    Button("Restart Audio…") { run { try DriverInstaller.restartCoreAudio() } }
-                    Spacer()
                     Button("Diagnostics…") { showDiagnostics = true }
+                    Spacer()
                 }
-            } header: { Text("Audio Driver") }
+            } header: { Text("Diagnostics") }
         }
         .formStyle(.grouped)
         .alert("Faded", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
@@ -153,17 +127,11 @@ private struct GeneralSettings: View {
         }
     }
 
-    private func run(_ op: () throws -> Void) {
+    private func removeLegacyDriver() {
         do {
-            try op()
-            Task { @MainActor in
-                for _ in 0 ..< 20 {
-                    try? await Task.sleep(for: .milliseconds(500))
-                    router.driver.refresh()
-                    if router.driver.isReady, router.enabled { router.engage(); break }
-                }
-            }
-        } catch DriverInstaller.InstallError.cancelled {
+            try LegacyDriver.remove()
+            legacyInstalled = LegacyDriver.isInstalled
+        } catch LegacyDriver.RemoveError.cancelled {
         } catch {
             message = error.localizedDescription
         }
