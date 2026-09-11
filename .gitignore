@@ -15,4 +15,4 @@ DerivedData/
 .DS_Store
 
 # moved to github.com/pillgat3s/faded-tabs; an untracked copy may linger locally
-extension/
+extension
