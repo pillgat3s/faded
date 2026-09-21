@@ -427,6 +427,7 @@ struct MenuView: View {
         .contextMenu {
             Button("Reset to 100%") { router.resetAppGain(app.id) }
             Button(app.starred ? "Don't Always Show" : "Always Show") { router.setAppStarred(app.id, !app.starred) }
+            Button("Bypass Faded for \(app.name)") { router.setAppBypassed(app.id, true) }
             Divider()
             Text(app.id)
         }

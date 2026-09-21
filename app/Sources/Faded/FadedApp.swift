@@ -55,9 +55,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let args = CommandLine.arguments
             let mode = i + 1 < args.count ? args[i + 1] : "full"
             let secs = i + 2 < args.count ? Double(args[i + 2]) ?? 10 : 10
+            let pid = i + 3 < args.count ? pid_t(args[i + 3]) ?? 0 : 0
+            let device = i + 4 < args.count ? args[i + 4] : nil
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(1))
-                TapProbe.run(mode: mode, seconds: secs) {
+                TapProbe.run(mode: mode, seconds: secs, pid: pid, deviceName: device) {
                     self.router.shutdown()
                     NSApp.terminate(nil)
                 }

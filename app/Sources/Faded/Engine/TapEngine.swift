@@ -78,6 +78,14 @@ final class TapEngine {
     private(set) var lastError: String?
     let shared = TapEngineShared()
 
+    /// Decides whether a process gets a tap at all. An untapped process plays
+    /// straight to its device: no gain, no meter, and — the reason this exists
+    /// — none of its audio in Faded's own output. An app that captures the
+    /// system "minus itself" (Discord's screen share) would otherwise capture
+    /// its own voices coming back out of Faded and send them to the people
+    /// speaking.
+    var shouldTap: (@MainActor (pid_t, String) -> Bool)?
+
     /// Fired after the process set changes (new app, app quit).
     var onProcessesChanged: (@MainActor () -> Void)?
     /// Fired whenever any process starts or stops running output.
@@ -196,6 +204,15 @@ final class TapEngine {
         }
     }
 
+    /// Re-run the tap/no-tap decision for every process (the bypass list
+    /// changed). Only meaningful while the engine is up: taps are muted
+    /// unconditionally, so creating them with nothing reading would silence
+    /// the machine.
+    func reevaluateTaps() {
+        guard output != nil else { return }
+        refreshProcesses(notify: true)
+    }
+
     private func processListChanged() {
         // Process births come in bursts (an app plus its helpers); coalesce.
         guard !pendingRefresh else { return }
@@ -214,14 +231,16 @@ final class TapEngine {
         let me = ProcessInfo.processInfo.processIdentifier
         var changed = false
 
-        // Gone
+        // Gone, or no longer ours to touch (its app was put on the bypass list)
         let live = Set(ids)
-        for p in processes where !live.contains(p.id) {
+        let dropped = processes.filter { !live.contains($0.id) || !(shouldTap?($0.pid, $0.bundleID) ?? true) }
+        for p in dropped {
             AudioHardwareDestroyProcessTap(p.tap)
             runningListeners[p.id] = nil
             changed = true
         }
-        processes.removeAll { !live.contains($0.id) }
+        let droppedIDs = Set(dropped.map(\.id))
+        processes.removeAll { droppedIDs.contains($0.id) }
 
         // New
         let known = Set(processes.map(\.id))
@@ -229,6 +248,7 @@ final class TapEngine {
             let pid = (try? AudioObject.get(id, .init(kAudioProcessPropertyPID), as: pid_t.self)) ?? 0
             guard pid > 0, pid != me else { continue }
             let bundle = AudioObject.getString(id, .init(kAudioProcessPropertyBundleID)) ?? ""
+            guard shouldTap?(pid, bundle) ?? true else { continue }
             let desc = CATapDescription(stereoMixdownOfProcesses: [id])
             desc.name = "Faded \(pid)"
             desc.isPrivate = true
@@ -317,6 +337,11 @@ final class TapEngine {
         let uuids = processes.prefix(TapEngineShared.capacity).map(\.tapUUID) as NSArray
         do {
             try AudioObject.setCF(aggregate, .init(kAudioAggregateDevicePropertyTapList), uuids)
+            // The stream list just changed length; the usage map must follow.
+            if let pid = procID {
+                _ = Self.switchOffDeviceInputs(aggregate: aggregate, procID: pid,
+                                               tapCount: min(processes.count, TapEngineShared.capacity))
+            }
         } catch {
             trace("tap engine: live tap list refused (\(error)) — rebuilding")
             if let dev = output {
@@ -344,6 +369,11 @@ final class TapEngine {
             TapEngine.ioCycle(shared, input, output)
         }
         guard st == noErr, let pid else { throw AudioError.osStatus(st, "AudioDeviceCreateIOProcIDWithBlock") }
+        let off = Self.switchOffDeviceInputs(aggregate: aggregate, procID: pid,
+                                             tapCount: min(processes.count, TapEngineShared.capacity))
+        if off.deviceInputs > 0 {
+            trace("tap engine: \(off.deviceInputs) input stream(s) of \(output?.name ?? "the device") kept closed (status \(off.status))")
+        }
         st = AudioDeviceStart(aggregate, pid)
         guard st == noErr else {
             AudioDeviceDestroyIOProcID(aggregate, pid)
@@ -351,6 +381,36 @@ final class TapEngine {
         }
         procID = pid
         isRunning = true
+    }
+
+    /// An output device can bring inputs of its own into the aggregate — a
+    /// USB headset base station's capture stream, for one. Faded has no use
+    /// for them, and an IOProc that leaves them enabled opens that input for
+    /// as long as it runs: a live capture stream and the orange indicator,
+    /// for nothing. This tells the HAL our IOProc wants only the tap streams,
+    /// which come last in the aggregate's input list.
+    static func switchOffDeviceInputs(aggregate: AudioObjectID, procID: AudioDeviceIOProcID,
+                                      tapCount: Int) -> (deviceInputs: Int, status: OSStatus) {
+        let streams = (try? AudioObject.getArray(aggregate,
+            AudioObjectPropertyAddress(kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeInput),
+            of: AudioObjectID.self))?.count ?? 0
+        let deviceInputs = streams - tapCount
+        guard deviceInputs > 0, tapCount >= 0 else { return (0, noErr) }
+
+        // AudioHardwareIOProcStreamUsage ends in a variable-length array.
+        let flagsOffset = MemoryLayout<AudioHardwareIOProcStreamUsage>.offset(of: \.mStreamIsOn) ?? 12
+        let size = flagsOffset + streams * MemoryLayout<UInt32>.size
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: MemoryLayout<AudioHardwareIOProcStreamUsage>.alignment)
+        defer { raw.deallocate() }
+        memset(raw, 0, size)
+        let usage = raw.assumingMemoryBound(to: AudioHardwareIOProcStreamUsage.self)
+        usage.pointee.mIOProc = unsafeBitCast(procID, to: UnsafeMutableRawPointer.self)
+        usage.pointee.mNumberStreams = UInt32(streams)
+        let flags = raw.advanced(by: flagsOffset).assumingMemoryBound(to: UInt32.self)
+        for i in 0 ..< streams { flags[i] = i < deviceInputs ? 0 : 1 }
+        var addr = AudioObjectPropertyAddress(kAudioDevicePropertyIOProcStreamUsage, scope: kAudioObjectPropertyScopeInput)
+        let st = AudioObjectSetPropertyData(aggregate, &addr, 0, nil, UInt32(size), raw)
+        return (deviceInputs, st)
     }
 
     private func stopIO() {
@@ -394,9 +454,13 @@ final class TapEngine {
         }
 
         let master = s.masterMuted ? 0 : s.master
+        // Tap streams come last in the aggregate's input list. A sub-device
+        // with inputs of its own (a USB headset's microphone) puts those
+        // first, and they must never be mistaken for an app.
         let slots = min(s.slotCount, inB.count)
+        let base = inB.count - slots
         for slot in 0 ..< slots {
-            let b = inB[slot]
+            let b = inB[base + slot]
             guard let src = b.mData?.assumingMemoryBound(to: Float.self) else { continue }
             let ch = Int(max(b.mNumberChannels, 1))
             let n = min(frames, Int(b.mDataByteSize) / (4 * ch))

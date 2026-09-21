@@ -132,6 +132,20 @@ final class AudioRouter {
     private(set) var hiddenOutputUIDs: Set<String>
     private(set) var hiddenInputUIDs: Set<String>
     private(set) var starredApps: Set<String>
+    /// Apps Faded leaves completely alone: never tapped, so they play straight
+    /// to the device and none of their audio comes out of Faded's process.
+    private(set) var bypassedApps: Set<String>
+
+    /// Discord's screen share captures the whole system except Discord
+    /// itself. Voices replayed by Faded are not "Discord" to that capture, so
+    /// they would be streamed back to the people speaking.
+    static let defaultBypassedApps = ["com.hnc.Discord", "com.hnc.DiscordPTB", "com.hnc.DiscordCanary"]
+
+    struct BypassedApp: Identifiable {
+        let id: String
+        let name: String
+        let icon: NSImage
+    }
 
     // MARK: Derived views for the UI
 
@@ -242,6 +256,7 @@ final class AudioRouter {
         static let hiddenOutputs = "hiddenOutputUIDs"
         static let hiddenInputs = "hiddenInputUIDs"
         static let starredApps = "starredApps"
+        static let bypassedApps = "bypassedApps"
     }
 
     init() {
@@ -258,6 +273,7 @@ final class AudioRouter {
         hiddenOutputUIDs = Set(defaults.stringArray(forKey: Keys.hiddenOutputs) ?? [])
         hiddenInputUIDs = Set(defaults.stringArray(forKey: Keys.hiddenInputs) ?? [])
         starredApps = Set(defaults.stringArray(forKey: Keys.starredApps) ?? [])
+        bypassedApps = Set(defaults.stringArray(forKey: Keys.bypassedApps) ?? Self.defaultBypassedApps)
 
         deviceListListener = AudioObject.listen(AudioSystem.object, .init(kAudioHardwarePropertyDevices)) { [weak self] in
             Task { @MainActor in self?.devicesChanged() }
@@ -275,9 +291,11 @@ final class AudioRouter {
         }
 
         // `--render-menu` / `--render-settings` only rasterise the UI from
-        // invented state; they must not touch devices, Bluetooth or the bridge.
-        let rendering = CommandLine.arguments.contains { $0.hasPrefix("--render-") }
-        guard !rendering else { return }
+        // invented state, and `--tap-probe` runs an experiment of its own next
+        // to the real app: none of them may touch devices, Bluetooth or the
+        // bridge, let alone start a second tap engine.
+        let headless = CommandLine.arguments.contains { $0.hasPrefix("--render-") || $0 == "--tap-probe" }
+        guard !headless else { return }
 
         bridge.onTabs = { [weak self] tabs in
             // Audible first, then anything holding a non-default setting.
@@ -290,6 +308,10 @@ final class AudioRouter {
         }
         bridge.start()
 
+        tapEngine.shouldTap = { [weak self] pid, bundleID in
+            guard let self, !self.bypassedApps.isEmpty else { return true }
+            return !self.bypassedApps.contains(ProcessResolver.resolve(pid: pid, bundleID: bundleID).id)
+        }
         tapEngine.onProcessesChanged = { [weak self] in
             self?.pushAllAppGains()
             self?.refreshApps()
@@ -946,6 +968,25 @@ final class AudioRouter {
         refreshApps()
     }
 
+    /// Take an app out of Faded's hands, or give it back.
+    func setAppBypassed(_ appID: String, _ bypassed: Bool) {
+        if bypassed { bypassedApps.insert(appID) } else { bypassedApps.remove(appID) }
+        defaults.set(Array(bypassedApps), forKey: Keys.bypassedApps)
+        trace("bypass \(bypassed ? "on" : "off") for \(appID)")
+        tapEngine.reevaluateTaps()
+        refreshApps()
+    }
+
+    func bypassedEntries() -> [BypassedApp] {
+        bypassedApps.map { id in
+            let info = ProcessResolver.staticInfo(bundleID: id)
+            return BypassedApp(id: id,
+                               name: appNames[id] ?? info?.name ?? id,
+                               icon: info?.icon ?? NSImage(systemSymbolName: "app.dashed", accessibilityDescription: nil) ?? NSImage())
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
     func resetAppGain(_ appID: String) {
         appGains[appID] = nil
         appMutedLevels[appID] = nil
@@ -1127,6 +1168,7 @@ final class AudioRouter {
         s += "input: \(selectedInput?.name ?? "-")\n"
         s += "engine: \(tapEngine.stats)\n"
         s += "accessibility: \(MediaKeyTap.hasAccessibility)  bridge: \(browserBridgeConnected ? "connected" : "not connected")\n"
+        s += "bypassed: \(bypassedApps.sorted().joined(separator: ", "))\n"
         s += "legacy driver installed: \(LegacyDriver.isInstalled)\n"
         if let err = lastError { s += "last error: \(err)" }
         return s

@@ -230,6 +230,31 @@ private struct AppSettings: View {
                 Text("Starred apps always appear in the menu, even when they're silent. Everything else shows up while it's playing.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+
+            Section {
+                let bypassed = router.bypassedEntries()
+                if bypassed.isEmpty {
+                    Text("None. Right-click an app in the menu to bypass it.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(bypassed) { app in
+                    HStack(spacing: 8) {
+                        Image(nsImage: app.icon).resizable().frame(width: 16, height: 16)
+                        Text(app.name).lineLimit(1)
+                        Spacer()
+                        Button {
+                            router.setAppBypassed(app.id, false)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Let Faded control \(app.name) again")
+                    }
+                }
+            } header: { Text("Bypassed apps") } footer: {
+                Text("Bypassed apps play straight to the device: no slider, and on a device without hardware volume they ignore the volume keys. Discord is here by default. Its screen share captures everything except Discord itself, so voices replayed by Faded would be streamed back to the people speaking.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         .onAppear { router.refreshApps() }

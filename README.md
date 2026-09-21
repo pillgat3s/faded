@@ -98,6 +98,27 @@ Only apps that have recently produced a signal are listed — otherwise you get
 every daemon on the system that happens to hold the device open. Gains persist
 per app and apply from the first sample the next time it plays.
 
+**Other apps' captures.** Screen recorders and screen shares work as if Faded
+were not there. A capture still sees every app's own audio — the tap mutes it
+at the device, not for other listeners — and never sees Faded's copy: a tap
+aimed at Faded's own process records silence, so nothing is captured twice and
+an app that captures "the system minus itself" does not get its own audio back
+by way of Faded. `--tap-probe only <pid>` and `excluding <pid>` reproduce both
+measurements.
+
+**Bypassed apps.** Apps on the bypass list (Settings → Apps, or right-click an
+app in the menu) are never tapped: they play straight to the device, with no
+slider, and on a device without hardware volume they ignore the volume keys.
+Discord is bypassed by default, as a precaution. A voice call is the one place
+where an extra IO cycle between what an app renders and what is heard matters
+(its echo canceller uses the rendered audio as its reference), so its audio is
+left exactly as macOS delivers it.
+
+**Devices with inputs of their own.** Some output devices bring a capture
+stream into the aggregate (a USB headset base station does). Tap streams come
+last in the aggregate's input list; the mixer reads only those and asks the HAL
+to leave the device's own inputs closed.
+
 **Meters.** Output level and per-app levels come free from the mix. Input
 level does not exist as a property anywhere in CoreAudio, so it can only be
 obtained by opening a capture stream, which is why that meter is opt-in and
@@ -184,8 +205,12 @@ make app CONFIG=Debug
 is generated.)
 
 Two headless probes exercise the interesting paths and report to the trace
-file: `Faded --tap-probe [full|unmuted|notap] [seconds]` runs a minimal tap
-engine, and `Faded --bt-connect <mac>` runs the Bluetooth connect flow.
+file. `Faded --tap-probe <mode> [seconds] [pid] [device]` runs experiments on
+the tap machinery next to the real app (`full`, `unmuted`, `notap`, `global`,
+`only`, `excluding`, `usage`, `inputs` — see `TapProbe.swift`), and
+`Faded --bt-connect <mac>` runs the Bluetooth connect flow. Launch them through
+LaunchServices (`open -n Faded.app --args …`) so the permissions are
+attributed to Faded rather than to your shell.
 
 ## Install
 
@@ -214,8 +239,8 @@ turn one on.
 - The first few tens of milliseconds after an app starts playing from total
   silence are muted while Faded's stream comes up. Players that keep their
   stream open (most of them) never hit this.
-- Per-app gain applies to the audio an app sends to the system default
-  device; an app addressing some other device directly is left alone.
+- A bypassed app ignores the volume keys on a device without hardware volume,
+  because nothing of it passes through Faded. Use the app's own volume there.
 - Input volume only works on devices that expose a hardware input control.
 - Not suitable for bit-perfect playback chains — there is an extra hop.
 

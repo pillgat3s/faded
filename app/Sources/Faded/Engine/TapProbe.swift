@@ -1,76 +1,149 @@
-// TapProbe.swift — is Apple's process-tap route viable for Faded?
+// TapProbe.swift — headless experiments on the process-tap machinery.
 //
-// `Faded --tap-probe` builds the smallest possible version of a tap engine:
-// one global tap (every process, muted at the source) feeding an aggregate
-// device whose only sub-device is the current default output, with an IO
-// proc that copies tap input straight to the output. If audio keeps playing
-// normally while this runs, the whole "per-app control without owning the
-// default device" idea is proven in one go. Results go to the trace file.
+// `Faded --tap-probe <mode> [seconds] [pid]`, results to the trace file. Run it
+// through LaunchServices (`open -n Faded.app --args …`) so the audio-capture
+// permission is attributed to Faded rather than to the shell.
+//
+//   full       global tap, muted at the source, passed through to the default
+//              device: the whole engine idea in twenty lines
+//   unmuted    the same without muting (everything is heard twice)
+//   notap      an aggregate of the output device alone — isolates the
+//              aggregate plumbing from taps and permissions
+//   excluding  what another app's capture sees: a listen-only global tap that
+//              leaves out one process (pid) and measures a 1 kHz test tone.
+//              This is Discord's screen share in miniature — it captures the
+//              system minus itself — and answers whether audio played by the
+//              excluded process still reaches the capture by way of Faded.
+//   only       a tap of just one process (pid): is that process's output
+//              capturable at all?
+//   global     listen-only capture of everything
+//   usage      like global, on a named device (4th argument), with the
+//              device's own input streams switched off the way the engine
+//              does it. `global` on the same device is the baseline.
+//   inputs     for every output device: how many input buffers an aggregate
+//              of [device + one tap] presents. More than one means the device
+//              brings inputs of its own, which the mixer must skip.
 
 import CoreAudio
 import Foundation
 
 final class TapProbeStats: @unchecked Sendable {
-    private var lock = os_unfair_lock()
     var cycles = 0
     var peak: Float = 0
+    var sumSquares = 0.0
+    var samples = 0.0
+    var sinSum = 0.0
+    var cosSum = 0.0
+    var phase = 0.0
+    var phaseStep = 0.0          // 2π·f/rate, set before IO starts
+    var passThrough = true
+    var deviceInputBuffersWithData = 0   // sub-device inputs that were actually delivered
+    var deviceInputPeak: Float = 0
     var inDesc = ""
     var outDesc = ""
 
     func cycle(_ input: UnsafePointer<AudioBufferList>, _ output: UnsafeMutablePointer<AudioBufferList>) {
         let inB = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         let outB = UnsafeMutableAudioBufferListPointer(output)
-        var p: Float = 0
-        if let src = inB.first, let dst = outB.first, let s = src.mData, let d = dst.mData {
-            let bytes = min(Int(src.mDataByteSize), Int(dst.mDataByteSize))
-            memcpy(d, s, bytes)
-            let n = bytes / MemoryLayout<Float>.size
+        for b in outB { if let d = b.mData { memset(d, 0, Int(b.mDataByteSize)) } }
+        // The tap stream is the last input buffer; a sub-device's own inputs come first.
+        if let src = inB.last, let s = src.mData {
+            let ch = Int(max(src.mNumberChannels, 1))
+            let n = Int(src.mDataByteSize) / (4 * ch)
             let f = s.assumingMemoryBound(to: Float.self)
-            for i in 0..<n { p = max(p, abs(f[i])) }
+            if passThrough, let dst = outB.first, let d = dst.mData {
+                memcpy(d, s, min(Int(src.mDataByteSize), Int(dst.mDataByteSize)))
+            }
+            var i = 0
+            while i < n {
+                let x = Double(f[i * ch])
+                let a = Float(abs(x))
+                if a > peak { peak = a }
+                sumSquares += x * x
+                sinSum += x * sin(phase)
+                cosSum += x * cos(phase)
+                phase += phaseStep
+                i += 1
+            }
+            samples += Double(n)
         }
-        os_unfair_lock_lock(&lock)
-        cycles += 1
-        peak = max(peak, p)
-        if cycles == 1 {
+        // Everything before the last buffer belongs to the sub-device itself.
+        if inB.count > 1 {
+            var live = 0
+            for b in inB.dropLast() {
+                guard let d = b.mData else { continue }
+                live += 1
+                let f = d.assumingMemoryBound(to: Float.self)
+                let n = Int(b.mDataByteSize) / 4
+                var i = 0
+                while i < n { let a = abs(f[i]); if a > deviceInputPeak { deviceInputPeak = a }; i += 1 }
+            }
+            if live > deviceInputBuffersWithData { deviceInputBuffersWithData = live }
+        }
+        if cycles == 0 {
             inDesc = inB.map { "\($0.mNumberChannels)ch/\($0.mDataByteSize)B" }.joined(separator: ",")
             outDesc = outB.map { "\($0.mNumberChannels)ch/\($0.mDataByteSize)B" }.joined(separator: ",")
         }
-        os_unfair_lock_unlock(&lock)
+        cycles += 1
     }
+
+    var rms: Double { samples > 0 ? (sumSquares / samples).squareRoot() : 0 }
+    /// Amplitude of the 1 kHz test tone in the capture; ~0 when absent.
+    var tone: Double { samples > 0 ? 2 * (sinSum * sinSum + cosSum * cosSum).squareRoot() / samples : 0 }
 }
 
 @MainActor
 enum TapProbe {
-    /// mode: "full" = tap + default output sub-device, muted at source;
-    /// "unmuted" = same without muting; "taponly" = capture-only aggregate;
-    /// "speakers" = tap + built-in speakers sub-device, unmuted.
-    static func run(mode: String, seconds: Double, completion: @escaping @MainActor () -> Void) {
-        guard let outID = AudioSystem.defaultOutputDevice, var dev = AudioDevice(id: outID) else {
-            trace("tap probe: no default output"); completion(); return
+    static let toneHz = 1000.0
+
+    static func run(mode: String, seconds: Double, pid: pid_t = 0, deviceName: String? = nil,
+                    completion: @escaping @MainActor () -> Void) {
+        if mode == "inputs" { surveyInputs(); completion(); return }
+
+        var chosen: AudioDevice?
+        if let deviceName, !deviceName.isEmpty {
+            chosen = AudioDevice.selectableOutputs().first { $0.name.localizedCaseInsensitiveContains(deviceName) }
+        } else {
+            chosen = AudioSystem.defaultOutputDevice.flatMap(AudioDevice.init(id:))
         }
-        if mode == "speakers", let spk = AudioDevice.selectableOutputs().first(where: { $0.transport == .builtIn }) {
-            dev = spk
+        guard let dev = chosen else {
+            trace("tap probe[\(mode)]: done — no such output device"); completion(); return
         }
-        trace("tap probe[\(mode)]: begin")
-        let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+        trace("tap probe[\(mode)]: begin, output=\(dev.name)")
+
+        var excluded: [AudioObjectID] = []
+        var only: [AudioObjectID] = []
+        if mode == "only" {
+            guard let obj = processObject(for: pid) else {
+                trace("tap probe[only]: done — pid \(pid) has no CoreAudio process object"); completion(); return
+            }
+            only = [obj]
+            trace("tap probe: tapping only pid \(pid) → process object \(obj)")
+        }
+        if mode == "excluding" {
+            guard let obj = processObject(for: pid) else {
+                trace("tap probe[excluding]: done — pid \(pid) has no CoreAudio process object"); completion(); return
+            }
+            excluded = [obj]
+            let app = ProcessResolver.resolve(pid: pid, bundleID: AudioObject.getString(obj, .init(kAudioProcessPropertyBundleID)) ?? "")
+            trace("tap probe: excluding pid \(pid) → process object \(obj), resolves to app id \(app.id) (\(app.name))")
+        }
+
+        let desc = only.isEmpty ? CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
+                                : CATapDescription(stereoMixdownOfProcesses: only)
         desc.name = "Faded tap probe"
         desc.isPrivate = true
-        if mode == "full" {
-            desc.muteBehavior = CATapMuteBehavior(rawValue: 2)!  // CATapMutedWhenTapped
-        }
+        if mode == "full" { desc.muteBehavior = CATapMuteBehavior(rawValue: 1)! }   // CATapMuted
+
         var tap = AudioObjectID(kAudioObjectUnknown)
         var st: OSStatus = noErr
+        var rate = 48000.0
         if mode != "notap" {
             st = AudioHardwareCreateProcessTap(desc, &tap)
-            trace("tap probe: create tap status=\(st) id=\(tap)")
-            guard st == noErr else { completion(); return }
-
-            var fmtAddr = AudioObjectPropertyAddress(mSelector: kAudioTapPropertyFormat,
-                                                     mScope: kAudioObjectPropertyScopeGlobal, mElement: 0)
-            var fmt = AudioStreamBasicDescription()
-            var fsize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-            AudioObjectGetPropertyData(tap, &fmtAddr, 0, nil, &fsize, &fmt)
-            trace("tap probe: tap format \(fmt.mSampleRate)Hz ch=\(fmt.mChannelsPerFrame) flags=\(fmt.mFormatFlags) bytes/frame=\(fmt.mBytesPerFrame)")
+            guard st == noErr else { trace("tap probe: create tap failed \(st)"); completion(); return }
+            if let fmt = try? AudioObject.get(tap, .init(kAudioTapPropertyFormat), as: AudioStreamBasicDescription.self) {
+                rate = fmt.mSampleRate
+            }
         }
 
         var aggDesc: [String: Any] = [
@@ -79,23 +152,29 @@ enum TapProbe {
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
             kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceTapListKey: [[kAudioSubTapDriftCompensationKey: true,
-                                               kAudioSubTapUIDKey: desc.uuid.uuidString]],
+            kAudioAggregateDeviceMainSubDeviceKey: dev.uid,
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: dev.uid]],
         ]
-        if mode != "taponly" {
-            // The output device is the clock master; a tap alone never cycles.
-            aggDesc[kAudioAggregateDeviceMainSubDeviceKey] = dev.uid
-            aggDesc[kAudioAggregateDeviceSubDeviceListKey] = [[kAudioSubDeviceUIDKey: dev.uid]]
+        if mode != "notap" {
+            aggDesc[kAudioAggregateDeviceTapListKey] = [[kAudioSubTapDriftCompensationKey: true,
+                                                          kAudioSubTapUIDKey: desc.uuid.uuidString]]
         }
-        if mode == "notap" { aggDesc[kAudioAggregateDeviceTapListKey] = nil }
         var agg = AudioObjectID(kAudioObjectUnknown)
         st = AudioHardwareCreateAggregateDevice(aggDesc as CFDictionary, &agg)
-        trace("tap probe: aggregate status=\(st) id=\(agg) output=\(dev.name)")
-        guard st == noErr else { AudioHardwareDestroyProcessTap(tap); completion(); return }
+        guard st == noErr else {
+            trace("tap probe: aggregate failed \(st)")
+            if tap != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tap) }
+            completion(); return
+        }
+        Thread.sleep(forTimeInterval: 0.5)   // aggregates assemble asynchronously
+        // The aggregate runs at its clock device's rate (AirPods in call mode
+        // are 16 or 24 kHz), and that is the rate the tap stream arrives at.
+        if let r = try? AudioObject.get(agg, .init(kAudioDevicePropertyNominalSampleRate), as: Float64.self), r > 0 { rate = r }
+        trace("tap probe: aggregate rate \(rate) Hz")
 
-        // Aggregates assemble asynchronously; give the HAL a moment before IO.
-        Thread.sleep(forTimeInterval: 1)
         let stats = TapProbeStats()
+        stats.passThrough = (mode == "full" || mode == "unmuted")   // "global", "only", "excluding" just listen
+        stats.phaseStep = 2 * Double.pi * toneHz / rate
         var procID: AudioDeviceIOProcID?
         let ioQueue = DispatchQueue(label: "com.andri.faded.tapprobe.io", qos: .userInteractive)
         // @Sendable keeps the block nonisolated: it runs on the HAL's IO
@@ -103,20 +182,12 @@ enum TapProbe {
         st = AudioDeviceCreateIOProcIDWithBlock(&procID, agg, ioQueue) { @Sendable _, input, _, output, _ in
             stats.cycle(input, output)
         }
-        trace("tap probe: ioproc status=\(st)")
-        st = AudioDeviceStart(agg, procID)
-        trace("tap probe: start status=\(st) — running \(Int(seconds))s")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            Task { @MainActor in
-                func flag(_ id: AudioObjectID, _ sel: AudioObjectPropertySelector) -> String {
-                    var a = AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeGlobal, mElement: 0)
-                    var v: UInt32 = 0; var sz = UInt32(4)
-                    let r = AudioObjectGetPropertyData(id, &a, 0, nil, &sz, &v)
-                    return r == 0 ? "\(v)" : "err\(r)"
-                }
-                trace("tap probe: after 2s agg running=\(flag(agg, kAudioDevicePropertyDeviceIsRunning)) runningSomewhere=\(flag(agg, kAudioDevicePropertyDeviceIsRunningSomewhere)) alive=\(flag(agg, kAudioDevicePropertyDeviceIsAlive)) sub running=\(flag(dev.id, kAudioDevicePropertyDeviceIsRunning)) cycles=\(stats.cycles)")
-            }
+        if mode == "usage", let p = procID {
+            let off = TapEngine.switchOffDeviceInputs(aggregate: agg, procID: p, tapCount: 1)
+            trace("tap probe: switched off \(off.deviceInputs) device input stream(s), status \(off.status)")
         }
+        st = AudioDeviceStart(agg, procID)
+        trace("tap probe: start status=\(st), running \(Int(seconds))s")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
             Task { @MainActor in
@@ -124,9 +195,53 @@ enum TapProbe {
                 if let p = procID { AudioDeviceDestroyIOProcID(agg, p) }
                 AudioHardwareDestroyAggregateDevice(agg)
                 if tap != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tap) }
-                trace("tap probe: done cycles=\(stats.cycles) peak=\(stats.peak) in=[\(stats.inDesc)] out=[\(stats.outDesc)]")
+                trace(String(format: "tap probe[%@]: done cycles=%d peak=%.5f rms=%.5f tone1k=%.5f in=[%@] out=[%@] deviceInputsDelivered=%d deviceInputPeak=%.5f",
+                             mode, stats.cycles, stats.peak, stats.rms, stats.tone, stats.inDesc, stats.outDesc,
+                             stats.deviceInputBuffersWithData, stats.deviceInputPeak))
                 completion()
             }
+        }
+    }
+
+    private static func processObject(for pid: pid_t) -> AudioObjectID? {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        var qualifier = pid
+        var obj = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let st = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr,
+                                            UInt32(MemoryLayout<pid_t>.size), &qualifier, &size, &obj)
+        return st == noErr && obj != kAudioObjectUnknown ? obj : nil
+    }
+
+    /// No IO: just build [device + one tap] for every output device and count
+    /// the input streams the aggregate ends up with.
+    private static func surveyInputs() {
+        let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+        desc.name = "Faded tap probe"
+        desc.isPrivate = true
+        var tap = AudioObjectID(kAudioObjectUnknown)
+        guard AudioHardwareCreateProcessTap(desc, &tap) == noErr else { trace("tap probe: create tap failed"); return }
+        defer { AudioHardwareDestroyProcessTap(tap) }
+        for dev in AudioDevice.selectableOutputs() {
+            let aggDesc: [String: Any] = [
+                kAudioAggregateDeviceNameKey: "Faded Probe",
+                kAudioAggregateDeviceUIDKey: "com.andri.faded.probe.\(UUID().uuidString)",
+                kAudioAggregateDeviceIsPrivateKey: true,
+                kAudioAggregateDeviceMainSubDeviceKey: dev.uid,
+                kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: dev.uid]],
+                kAudioAggregateDeviceTapListKey: [[kAudioSubTapUIDKey: desc.uuid.uuidString]],
+            ]
+            var agg = AudioObjectID(kAudioObjectUnknown)
+            guard AudioHardwareCreateAggregateDevice(aggDesc as CFDictionary, &agg) == noErr else {
+                trace("tap probe[inputs]: \(dev.name): aggregate failed"); continue
+            }
+            Thread.sleep(forTimeInterval: 0.4)
+            let ins = (try? AudioObject.getArray(agg, AudioObjectPropertyAddress(kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeInput), of: AudioObjectID.self))?.count ?? -1
+            let outs = (try? AudioObject.getArray(agg, AudioObjectPropertyAddress(kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeOutput), of: AudioObjectID.self))?.count ?? -1
+            trace("tap probe[inputs]: \(dev.name) hasInput=\(dev.hasInput) → aggregate input streams=\(ins) (1 = just the tap), output streams=\(outs)")
+            AudioHardwareDestroyAggregateDevice(agg)
         }
     }
 }
