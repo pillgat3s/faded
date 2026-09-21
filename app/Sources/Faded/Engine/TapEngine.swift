@@ -6,25 +6,37 @@
 // macOS keys off exactly that — AirPods auto-switching, ear detection, the
 // iPhone handoff, Control Center's own device list.
 //
-// This engine leaves the default device alone. Every process that CoreAudio
-// knows about gets a *process tap* (macOS 14.4+): the process's audio is
-// muted at the device and handed to us instead; we apply its gain, sum
-// everything, apply the master gain where the device has no volume control
-// of its own, and play the result to the very same device through an
-// aggregate that has that device as its clock master. One IO cycle of
-// latency, no resampling, no drift loop, no shared memory, no driver.
+// This engine leaves the default device alone, and leaves every app alone
+// until there is a reason not to. Each process CoreAudio knows about gets a
+// *process tap* (macOS 14.4+). By default the tap only listens: that is what
+// feeds the level meters and the list of apps that are playing, and it changes
+// nothing about the audio. An app is *taken over* — its tap muted at the
+// device, its audio re-played by Faded at the right gain — only while that is
+// needed: its level is below 100 %, it is muted, or the device has no volume
+// control of its own and the master gain has to be applied in software. The
+// re-played mix goes to the very same device through an aggregate that has
+// that device as its clock master: one IO cycle of latency, no resampling, no
+// drift loop, no driver.
 //
-// Tapping every process — not just the ones playing — matters: a tap that is
-// created after the first buffer lets that buffer through at full level, and
-// on a device without hardware volume that is an audible blip.
+// Why not simply take everything over (the first version of this engine did):
+// other apps' captures see BOTH a muted original and Faded's re-play. A screen
+// share or recording therefore gets a taken-over app twice, ~an IO cycle
+// apart — and an app that captures "the system minus itself", as Discord's
+// screen share does, gets its own audio back through Faded's copy, which is
+// how people in a call end up hearing themselves. Measured with
+// `--tap-probe mini` + `devcap`; an app that is merely listened to is captured
+// once, exactly as without Faded.
 //
-// The engine's own output stream runs only while some tapped process is
-// running output. macOS reads an open output stream as "the Mac is playing"
-// — it is what makes in-ear AirPods jump over from an iPhone — so Faded must
-// look exactly like the apps it carries: streaming when they stream, silent
-// and stream-less when they are not. Taps are muted unconditionally (not
-// only while being read) so the moment between an app starting and our
-// stream coming up is a short silence, never a burst at full level.
+// A tap is created the moment a process appears, already muted if the app's
+// stored level calls for it — a tap muted only after the first buffer lets
+// that buffer through at full level, which on a device without hardware
+// volume is an audible blip.
+//
+// IO runs only while it has a job: some taken-over app is running output (its
+// audio exists nowhere else — muted taps are muted whether or not anyone
+// reads them), or the menu is open and wants meters. macOS reads an open
+// output stream as "the Mac is playing" — it is what makes in-ear AirPods jump
+// over from an iPhone — so an idle Faded holds no stream at all.
 //
 // Real-time rules in `ioBlock`: no allocation, no locks, no Swift runtime
 // calls that could take a lock. Tables are fixed-capacity and written from
@@ -39,6 +51,7 @@ final class TapEngineShared: @unchecked Sendable {
     static let capacity = 256
 
     let gains: UnsafeMutablePointer<Float>   // per slot, 0…1, already muted-aware
+    let replay: UnsafeMutablePointer<UInt32> // per slot, 1 = taken over: mix it into the output
     let peaks: UnsafeMutablePointer<Float>   // per slot, max-hold, reset by the reader
     var slotCount = 0
     var master: Float = 1
@@ -47,16 +60,20 @@ final class TapEngineShared: @unchecked Sendable {
     var outPeakR: Float = 0
     var cycles: UInt64 = 0
     var lastInputBuffers = 0
+    var lastOutputDesc = 0          // channels of the first output buffer × 100 + buffer count
 
     init() {
         gains = .allocate(capacity: Self.capacity)
         gains.initialize(repeating: 1, count: Self.capacity)
+        replay = .allocate(capacity: Self.capacity)
+        replay.initialize(repeating: 0, count: Self.capacity)
         peaks = .allocate(capacity: Self.capacity)
         peaks.initialize(repeating: 0, count: Self.capacity)
     }
 
     deinit {
         gains.deallocate()
+        replay.deallocate()
         peaks.deallocate()
     }
 }
@@ -65,9 +82,11 @@ struct TappedProcess: Identifiable, Hashable, Sendable {
     let id: AudioObjectID         // the CoreAudio process object
     let pid: pid_t
     let bundleID: String
-    let tap: AudioObjectID
-    let tapUUID: String
+    var tap: AudioObjectID
+    var tapUUID: String
     var slot: Int
+    /// Muted at the device and re-played by Faded. False = only listened to.
+    var takenOver: Bool
 }
 
 @MainActor
@@ -86,6 +105,10 @@ final class TapEngine {
     /// speaking.
     var shouldTap: (@MainActor (pid_t, String) -> Bool)?
 
+    /// The stored level for a process's app (0 when muted). Asked when a tap is
+    /// created, so an app that must be quieter is never heard at full level.
+    var gainFor: (@MainActor (pid_t, String) -> Float)?
+
     /// Fired after the process set changes (new app, app quit).
     var onProcessesChanged: (@MainActor () -> Void)?
     /// Fired whenever any process starts or stops running output.
@@ -97,6 +120,7 @@ final class TapEngine {
     private var processListListener: ListenerToken?
     private var runningListeners: [AudioObjectID: ListenerToken] = [:]
     private var pendingRefresh = false
+    private var pendingGains: [AudioObjectID: Float] = [:]   // levels of taps not yet in a slot
 
     // MARK: Lifecycle
 
@@ -123,8 +147,8 @@ final class TapEngine {
         trace("tap engine: retargeted → \(device.name)")
     }
 
-    /// Everything off: taps destroyed (which un-mutes every process at the
-    /// device), aggregate gone, listeners dropped.
+    /// Everything off: taps destroyed (which gives every taken-over app back
+    /// to the device), aggregate gone, listeners dropped.
     func stop() {
         stopIO()
         destroyAggregate()
@@ -137,9 +161,9 @@ final class TapEngine {
         trace("tap engine: stopped")
     }
 
-    /// Idle release: keep taps and aggregate, just stop pulling. With no IO
-    /// the taps are inactive, so processes play straight to the device again
-    /// and our stream on it is gone — what lets AirPods hand back to a phone.
+    /// Idle release: keep taps and aggregate, just stop pulling, so our stream
+    /// on the device is gone — what lets AirPods hand back to a phone. Only
+    /// safe while no taken-over app is playing; the router checks.
     func pauseIO() {
         guard isRunning else { return }
         stopIO()
@@ -151,6 +175,14 @@ final class TapEngine {
     var anyProcessRunningOutput: Bool {
         processes.contains { isRunningOutput($0.id) }
     }
+
+    /// Is any *taken-over* process running output? Its audio exists nowhere
+    /// but in our mix, so this is when IO is not optional.
+    var anyTakenOverRunningOutput: Bool {
+        processes.contains { $0.takenOver && isRunningOutput($0.id) }
+    }
+
+    var takenOverCount: Int { processes.filter(\.takenOver).count }
 
     private func isRunningOutput(_ id: AudioObjectID) -> Bool {
         ((try? AudioObject.get(id, .init(kAudioProcessPropertyIsRunningOutput), as: UInt32.self)) ?? 0) != 0
@@ -165,13 +197,63 @@ final class TapEngine {
     // MARK: Gains and meters
 
     func setGain(forProcess id: AudioObjectID, _ gain: Float) {
-        guard let p = processes.first(where: { $0.id == id }), p.slot < TapEngineShared.capacity else { return }
-        shared.gains[p.slot] = min(max(gain, 0), 1)
+        guard let i = processes.firstIndex(where: { $0.id == id }), processes[i].slot >= 0,
+              processes[i].slot < TapEngineShared.capacity else { return }
+        shared.gains[processes[i].slot] = min(max(gain, 0), 1)
+        updateTakeover(at: i)
     }
 
     func setMaster(_ gain: Float, muted: Bool) {
         shared.master = min(max(gain, 0), 1)
         shared.masterMuted = muted
+        for i in processes.indices { updateTakeover(at: i) }
+    }
+
+    // MARK: Taking an app over, and giving it back
+
+    /// Software master gain in play? Then everything has to come through us.
+    private var masterNeedsSoftware: Bool { shared.masterMuted || shared.master != 1 }
+
+    private func needsTakeover(gain: Float) -> Bool { gain != 1 || masterNeedsSoftware }
+
+    private func updateTakeover(at i: Int) {
+        let slot = processes[i].slot
+        guard slot >= 0, slot < TapEngineShared.capacity else { return }
+        let want = needsTakeover(gain: shared.gains[slot])
+        guard want != processes[i].takenOver else { return }
+        if want {
+            // Mute first, then start re-playing: a gap of a cycle at most,
+            // rather than a cycle of the app at double level.
+            setTapMuted(at: i, true)
+            shared.replay[slot] = 1
+        } else {
+            setTapMuted(at: i, false)
+            shared.replay[slot] = 0
+        }
+        processes[i].takenOver = want
+        onOutputActivity?()   // IO may have just become necessary, or idle
+    }
+
+    /// Flip a live tap between listening and muting. The tap's description is
+    /// a settable property; if this system refuses, the tap is replaced.
+    private func setTapMuted(at i: Int, _ muted: Bool) {
+        let behavior = CATapMuteBehavior(rawValue: muted ? 1 : 0)!   // CATapMuted : CATapUnmuted
+        let tap = processes[i].tap
+        if let desc = try? AudioObject.getCF(tap, .init(kAudioTapPropertyDescription), as: CATapDescription.self) {
+            desc.muteBehavior = behavior
+            if (try? AudioObject.setCF(tap, .init(kAudioTapPropertyDescription), desc)) != nil { return }
+        }
+        trace("tap engine: live mute change refused for pid \(processes[i].pid) — replacing the tap")
+        let desc = CATapDescription(stereoMixdownOfProcesses: [processes[i].id])
+        desc.name = "Faded \(processes[i].pid)"
+        desc.isPrivate = true
+        desc.muteBehavior = behavior
+        var fresh = AudioObjectID(kAudioObjectUnknown)
+        guard AudioHardwareCreateProcessTap(desc, &fresh) == noErr else { return }
+        AudioHardwareDestroyProcessTap(tap)
+        processes[i].tap = fresh
+        processes[i].tapUUID = desc.uuid.uuidString
+        if aggregate != kAudioObjectUnknown { applyTapList() }
     }
 
     /// Per-process peak since the last call (max-hold, then cleared).
@@ -192,7 +274,7 @@ final class TapEngine {
     }
 
     var stats: String {
-        "aggregate=\(aggregate) running=\(isRunning) taps=\(processes.count) cycles=\(shared.cycles) inputs=\(shared.lastInputBuffers)"
+        "aggregate=\(aggregate) running=\(isRunning) taps=\(processes.count) takenOver=\(takenOverCount) cycles=\(shared.cycles) inputs=\(shared.lastInputBuffers) outPeak=\(max(shared.outPeakL, shared.outPeakR)) outBuffers=\(shared.lastOutputDesc)"
     }
 
     // MARK: Processes
@@ -205,9 +287,9 @@ final class TapEngine {
     }
 
     /// Re-run the tap/no-tap decision for every process (the bypass list
-    /// changed). Only meaningful while the engine is up: taps are muted
-    /// unconditionally, so creating them with nothing reading would silence
-    /// the machine.
+    /// changed). Only meaningful while the engine is up: a taken-over tap is
+    /// muted whether or not anyone reads it, so creating one with no engine
+    /// behind it would silence that app.
     func reevaluateTaps() {
         guard output != nil else { return }
         refreshProcesses(notify: true)
@@ -249,10 +331,12 @@ final class TapEngine {
             guard pid > 0, pid != me else { continue }
             let bundle = AudioObject.getString(id, .init(kAudioProcessPropertyBundleID)) ?? ""
             guard shouldTap?(pid, bundle) ?? true else { continue }
+            let gain = min(max(gainFor?(pid, bundle) ?? 1, 0), 1)
+            let takeOver = needsTakeover(gain: gain)
             let desc = CATapDescription(stereoMixdownOfProcesses: [id])
             desc.name = "Faded \(pid)"
             desc.isPrivate = true
-            desc.muteBehavior = CATapMuteBehavior(rawValue: 1)!  // CATapMuted — always
+            desc.muteBehavior = CATapMuteBehavior(rawValue: takeOver ? 1 : 0)!   // CATapMuted : CATapUnmuted
             var tap = AudioObjectID(kAudioObjectUnknown)
             let st = AudioHardwareCreateProcessTap(desc, &tap)
             guard st == noErr else {
@@ -260,7 +344,8 @@ final class TapEngine {
                 continue
             }
             processes.append(TappedProcess(id: id, pid: pid, bundleID: bundle, tap: tap,
-                                           tapUUID: desc.uuid.uuidString, slot: -1))
+                                           tapUUID: desc.uuid.uuidString, slot: -1, takenOver: takeOver))
+            pendingGains[id] = gain
             runningListeners[id] = AudioObject.listen(id, .init(kAudioProcessPropertyIsRunningOutput)) { [weak self] in
                 Task { @MainActor in self?.outputRunningChanged(id) }
             }
@@ -285,13 +370,15 @@ final class TapEngine {
     /// Slots follow the tap-list order, which is the order the aggregate
     /// presents the tap streams in. Gains are carried over by process.
     private func assignSlots() {
-        var gains: [AudioObjectID: Float] = [:]
+        var gains = pendingGains
+        pendingGains.removeAll()
         for p in processes where p.slot >= 0 && p.slot < TapEngineShared.capacity { gains[p.id] = shared.gains[p.slot] }
         processes.sort { $0.id < $1.id }
         let n = min(processes.count, TapEngineShared.capacity)
         for i in 0 ..< n {
             processes[i].slot = i
             shared.gains[i] = gains[processes[i].id] ?? 1
+            shared.replay[i] = processes[i].takenOver ? 1 : 0
             shared.peaks[i] = 0
         }
         if processes.count > n {
@@ -431,6 +518,7 @@ final class TapEngine {
         let outB = UnsafeMutableAudioBufferListPointer(output)
         s.cycles &+= 1
         s.lastInputBuffers = inB.count
+        s.lastOutputDesc = Int(outB.first?.mNumberChannels ?? 0) * 100 + outB.count
 
         // Output geometry: interleaved stereo in one buffer, or one buffer per
         // channel. Zero it all, then find where left and right live.
@@ -453,6 +541,7 @@ final class TapEngine {
             frames = Int(first.mDataByteSize) / (4 * ch)
         }
 
+        let mono = outStride == 1 && outL == outR
         let master = s.masterMuted ? 0 : s.master
         // Tap streams come last in the aggregate's input list. A sub-device
         // with inputs of its own (a USB headset's microphone) puts those
@@ -464,7 +553,9 @@ final class TapEngine {
             guard let src = b.mData?.assumingMemoryBound(to: Float.self) else { continue }
             let ch = Int(max(b.mNumberChannels, 1))
             let n = min(frames, Int(b.mDataByteSize) / (4 * ch))
-            let g = s.gains[slot] * master
+            // Listened-to apps are metered and left alone; only a taken-over
+            // app's audio is ours to play.
+            let g = s.replay[slot] != 0 ? s.gains[slot] * master : 0
             var peak: Float = 0
             var i = 0
             while i < n {
@@ -475,8 +566,15 @@ final class TapEngine {
                 if al > peak { peak = al }
                 if ar > peak { peak = ar }
                 if g != 0 {
-                    outL[i * outStride] += l * g
-                    outR[i * outStride] += r * g
+                    if mono {
+                        // A mono device (AirPods in call mode) gets the
+                        // average, as macOS's own downmix does — not L+R,
+                        // which is 6 dB hot and clips.
+                        outL[i] += 0.5 * (l + r) * g
+                    } else {
+                        outL[i * outStride] += l * g
+                        outR[i * outStride] += r * g
+                    }
                 }
                 i += 1
             }

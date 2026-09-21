@@ -308,9 +308,18 @@ final class AudioRouter {
         }
         bridge.start()
 
+        // FADED_DEBUG_ONLY_PID=<pid> narrows the engine to a single process —
+        // for experiments on how other apps' captures see Faded's output.
+        let onlyPID = pid_t(ProcessInfo.processInfo.environment["FADED_DEBUG_ONLY_PID"] ?? "") ?? 0
         tapEngine.shouldTap = { [weak self] pid, bundleID in
+            if onlyPID > 0 { return pid == onlyPID }
             guard let self, !self.bypassedApps.isEmpty else { return true }
             return !self.bypassedApps.contains(ProcessResolver.resolve(pid: pid, bundleID: bundleID).id)
+        }
+        tapEngine.gainFor = { [weak self] pid, bundleID in
+            guard let self else { return 1 }
+            let id = ProcessResolver.resolve(pid: pid, bundleID: bundleID).id
+            return self.appMutedLevels[id] != nil ? 0 : (self.appGains[id] ?? 1)
         }
         tapEngine.onProcessesChanged = { [weak self] in
             self?.pushAllAppGains()
@@ -828,12 +837,15 @@ final class AudioRouter {
         reconcileStream()
     }
 
-    /// Our stream runs exactly while some app runs output — what macOS sees
-    /// natively. Stopping waits a moment so players that close and reopen
-    /// their stream between tracks don't make us flap.
+    /// Our stream runs only while it has a job: a taken-over app is playing
+    /// (its audio exists nowhere but in our mix), or the menu is open and
+    /// wants meters. An idle Faded holds no stream at all. Stopping waits a
+    /// moment so players that close and reopen their stream between tracks
+    /// don't make us flap.
     private func reconcileStream() {
         guard isEngaged else { return }
-        let wanted = tapEngine.anyProcessRunningOutput
+        let wanted = tapEngine.anyTakenOverRunningOutput
+            || (menuPopoverIsVisible && tapEngine.anyProcessRunningOutput)
         if wanted {
             stopWork?.cancel()
             stopWork = nil
@@ -855,7 +867,9 @@ final class AudioRouter {
                 Task { @MainActor in
                     guard let self, self.isEngaged else { return }
                     self.stopWork = nil
-                    if !self.tapEngine.anyProcessRunningOutput { self.tapEngine.pauseIO() }
+                    let stillWanted = self.tapEngine.anyTakenOverRunningOutput
+                        || (self.menuPopoverIsVisible && self.tapEngine.anyProcessRunningOutput)
+                    if !stillWanted { self.tapEngine.pauseIO() }
                 }
             }
             stopWork = work
@@ -1044,6 +1058,7 @@ final class AudioRouter {
         meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 15.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tickMeters() }
         }
+        reconcileStream()   // meters need the engine listening
     }
 
     func stopMetering() {
@@ -1076,6 +1091,9 @@ final class AudioRouter {
             return
         }
         idleTicks = 0
+        // The menu just opened on an idle engine: start listening now rather
+        // than at the next one-second poll.
+        if isEngaged, !tapEngine.isRunning { reconcileStream() }
 
         if showMeters, showInputMeter, let i = selectedInput, InputMeter.canMeter(i) {
             inputMeter.start(device: i)

@@ -55,26 +55,31 @@ Since macOS 14.4 Core Audio has a sanctioned way to get at an application's
 audio before it reaches the device: a **process tap**. Faded is built on it.
 
 ```
- Spotify ─┐                       ┌──────────── Faded.app ────────────┐
- Discord ─┼─ process taps (muted  │ per-app gain ▸ mix ▸ master gain  │
- Safari  ─┘  at the device) ────▶ │ (software, only where the device  │
-                                  │  has no volume control of its own)│
-                                  └──────────────┬────────────────────┘
-                                                 │ one IO cycle later, on an
-                                                 │ aggregate clocked by…
-                                                 ▼
-                       Astro A50 / speakers / AirPods / AirPlay / USB DAC
-                            ═══ still the system default device ═══
+ Spotify ─┐  taps: every app is listened to (meters, app list) …
+ Discord ─┼─────────────────────────────────────────────────────▶ device, untouched
+ Safari  ─┘
+            … and an app is TAKEN OVER only while it has to be:
+              its level is below 100 %, it is muted, or the device
+              has no volume control of its own
+                  │ tap mutes it at the device
+                  ▼
+        ┌──────────── Faded.app ────────────┐
+        │ per-app gain ▸ mix ▸ master gain  │──▶ the same device, one IO cycle later
+        └───────────────────────────────────┘    (still the system default)
 ```
 
-Every process CoreAudio knows about gets a tap the moment it appears — not
-when it starts playing, because a tap created after the first buffer lets that
-buffer through at full level, and on a device without hardware volume that is
-an audible blip. The tap mutes the process at the device and hands Faded its
-audio; Faded applies the app's gain, sums everything, and plays the result to
-the very same device through a private aggregate device that uses it as the
-clock master. One IO cycle of latency (about 10 ms), no resampling, no drift
-compensation, no driver, nothing installed anywhere.
+Every process CoreAudio knows about gets a tap the moment it appears. By
+default the tap only *listens*: that feeds the level meters and the list of
+apps that are playing, and changes nothing about the audio. An app is *taken
+over* — its tap muted at the device, its audio re-played by Faded at the right
+gain — only while that is needed: its level is below 100 %, it is muted, or the
+device has no volume control of its own and the master gain has to be applied
+in software. The re-played mix goes to the very same device through a private
+aggregate device that uses it as the clock master: one IO cycle of latency
+(about 10 ms), no resampling, no drift compensation, no driver. An app whose
+stored level calls for it is tapped muted from birth, so it is never heard at
+full level first. At 100 % everywhere on a device with its own volume control,
+Faded touches nothing at all.
 
 **Volume keys.** Devices with hardware volume are left entirely to macOS — the
 keys, the Control Center slider and AirPods stem gestures all work natively
@@ -83,14 +88,11 @@ keys itself (an event tap, which needs the Accessibility permission), applies
 the change as a software master gain in its mix, and shows its own volume
 bezel since macOS no longer draws one.
 
-**Looking like the apps it carries.** macOS reads an open output stream as
-"the Mac is playing" — it is what makes in-ear AirPods jump over from an
-iPhone. Faded therefore keeps its own stream open only while some tapped
-process is running output, and drops it a couple of seconds after the last one
-stops, so what the system sees is exactly what it would see without Faded. The
-taps are muted unconditionally rather than only while being read, so the brief
-moment between an app starting and Faded's stream coming up is silence, never a
-burst.
+**Idle means idle.** macOS reads an open output stream as "the Mac is
+playing" — it is what makes in-ear AirPods jump over from an iPhone. Faded's
+own stream therefore runs only while it has a job: a taken-over app is playing
+(its audio exists nowhere else), or the menu is open and wants meters.
+Otherwise Faded holds no stream and costs nothing.
 
 **Per-app volume.** Each tap is one process; helper processes (Chrome Helper,
 WebKit GPU, Discord Helper) are resolved back to their owning app for display.
@@ -98,21 +100,21 @@ Only apps that have recently produced a signal are listed — otherwise you get
 every daemon on the system that happens to hold the device open. Gains persist
 per app and apply from the first sample the next time it plays.
 
-**Other apps' captures.** Screen recorders and screen shares work as if Faded
-were not there. A capture still sees every app's own audio — the tap mutes it
-at the device, not for other listeners — and never sees Faded's copy: a tap
-aimed at Faded's own process records silence, so nothing is captured twice and
-an app that captures "the system minus itself" does not get its own audio back
-by way of Faded. `--tap-probe only <pid>` and `excluding <pid>` reproduce both
-measurements.
+**Other apps' captures — why "only when needed" matters.** Another app's
+recording or screen share sees a muted original *and* Faded's re-play of it.
+A taken-over app is therefore captured twice, an IO cycle apart, and an app
+that captures "the system minus itself" — Discord's screen share does — gets
+its own audio back through Faded's copy, which is how the people in a call end
+up hearing themselves. An app that is only listened to is captured once,
+exactly as without Faded. All of this is measured, not assumed:
+`--tap-probe mini <pid>` is a one-app Faded, `devcap` and `excluding` are what
+another app's capture sees, and a 1 kHz tone detector tells one copy from two.
 
 **Bypassed apps.** Apps on the bypass list (Settings → Apps, or right-click an
-app in the menu) are never tapped: they play straight to the device, with no
-slider, and on a device without hardware volume they ignore the volume keys.
-Discord is bypassed by default, as a precaution. A voice call is the one place
-where an extra IO cycle between what an app renders and what is heard matters
-(its echo canceller uses the rendered audio as its reference), so its audio is
-left exactly as macOS delivers it.
+app in the menu) are never tapped at all, even when everything else has to be
+taken over for a software master volume. Discord is bypassed by default for the
+reason above. The cost: no slider for it, and on a device without hardware
+volume it ignores the volume keys — use its own output volume there.
 
 **Devices with inputs of their own.** Some output devices bring a capture
 stream into the aggregate (a USB headset base station does). Tap streams come
@@ -235,12 +237,15 @@ turn one on.
 
 - **macOS 14.4 or later** for the process-tap API; the project targets 26.
 - **Stereo only.** Taps are stereo mixdowns; multichannel content is folded.
-- About 10 ms of latency (one IO cycle) between an app and the device.
-- The first few tens of milliseconds after an app starts playing from total
-  silence are muted while Faded's stream comes up. Players that keep their
-  stream open (most of them) never hit this.
+- A taken-over app has about 10 ms of added latency (one IO cycle), and the
+  first few tens of milliseconds after it starts from total silence are muted
+  while Faded's stream comes up. Apps at 100 % are not delayed at all.
 - A bypassed app ignores the volume keys on a device without hardware volume,
   because nothing of it passes through Faded. Use the app's own volume there.
+- While an app is taken over, other apps' recordings and screen shares capture
+  it twice (the original and Faded's copy). On a device with its own volume
+  that is only the apps you turned down; on a device without one it is
+  everything below 100 % master volume.
 - Input volume only works on devices that expose a hardware input control.
 - Not suitable for bit-perfect playback chains — there is an extra hop.
 

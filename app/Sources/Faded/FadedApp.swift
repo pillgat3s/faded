@@ -47,6 +47,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         installStatusItemContextMenu()
+        // FADED_DEBUG_GAIN="bundle.id=0.5@8,bundle.id=1@20" moves an app's
+        // slider on a schedule (seconds after launch) — exercises taking an
+        // app over and giving it back while it plays, without a UI.
+        if let plan = ProcessInfo.processInfo.environment["FADED_DEBUG_GAIN"] {
+            for step in plan.split(separator: ",") {
+                let parts = step.split(whereSeparator: { $0 == "=" || $0 == "@" }).map(String.init)
+                guard parts.count == 3, let gain = Float(parts[1]), let after = Double(parts[2]) else { continue }
+                DispatchQueue.main.asyncAfter(deadline: .now() + after) { [weak self] in
+                    Task { @MainActor in
+                        self?.router.setAppGain(parts[0], gain)
+                        trace("debug: \(parts[0]) → \(gain)")
+                    }
+                }
+            }
+        }
         // `Faded --bt-connect <mac>` exercises the Bluetooth connect path
         // headless and reports to the trace file. Release builds too: the
         // Bluetooth TCC grant belongs to the installed app, so the probe must

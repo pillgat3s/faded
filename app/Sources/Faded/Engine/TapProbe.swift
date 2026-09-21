@@ -17,6 +17,14 @@
 //   only       a tap of just one process (pid): is that process's output
 //              capturable at all?
 //   global     listen-only capture of everything
+//   devcap     listen-only capture of ONE DEVICE'S STREAM (the default output,
+//              stream 0) minus one process (pid; 0 = exclude nothing). This is
+//              how Chromium's loopback capture — and with it Electron apps
+//              that share system audio — taps by default: it records what
+//              reaches the device, not what each process produced.
+//   mini       a one-app Faded: mute-tap only <pid> and re-play it to the
+//              default device, touching nothing else. Run it next to `devcap`
+//              to see whether a device-level capture hears the re-played copy.
 //   usage      like global, on a named device (4th argument), with the
 //              device's own input streams switched off the way the engine
 //              does it. `global` on the same device is the baseline.
@@ -52,7 +60,15 @@ final class TapProbeStats: @unchecked Sendable {
             let n = Int(src.mDataByteSize) / (4 * ch)
             let f = s.assumingMemoryBound(to: Float.self)
             if passThrough, let dst = outB.first, let d = dst.mData {
-                memcpy(d, s, min(Int(src.mDataByteSize), Int(dst.mDataByteSize)))
+                let och = Int(max(dst.mNumberChannels, 1))
+                let o = d.assumingMemoryBound(to: Float.self)
+                let frames = min(n, Int(dst.mDataByteSize) / (4 * och))
+                var k = 0
+                while k < frames {
+                    let l = f[k * ch], r = ch > 1 ? f[k * ch + 1] : l
+                    if och == 1 { o[k] = 0.5 * (l + r) } else { o[k * och] = l; o[k * och + 1] = r }
+                    k += 1
+                }
             }
             var i = 0
             while i < n {
@@ -94,7 +110,7 @@ final class TapProbeStats: @unchecked Sendable {
 
 @MainActor
 enum TapProbe {
-    static let toneHz = 1000.0
+    static var toneHz: Double { Double(ProcessInfo.processInfo.environment["FADED_PROBE_TONE"] ?? "") ?? 1000.0 }
 
     static func run(mode: String, seconds: Double, pid: pid_t = 0, deviceName: String? = nil,
                     completion: @escaping @MainActor () -> Void) {
@@ -129,11 +145,24 @@ enum TapProbe {
             trace("tap probe: excluding pid \(pid) → process object \(obj), resolves to app id \(app.id) (\(app.name))")
         }
 
-        let desc = only.isEmpty ? CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
+        var desc = only.isEmpty ? CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
                                 : CATapDescription(stereoMixdownOfProcesses: only)
+        if mode == "devcap" {
+            var ex: [AudioObjectID] = []
+            if pid > 0, let obj = processObject(for: pid) { ex = [obj] }
+            desc = CATapDescription(excludingProcesses: ex, deviceUID: dev.uid, stream: 0)
+            trace("tap probe: device-level capture of \(dev.name) stream 0, excluding \(ex)")
+        }
+        if mode == "mini" {
+            guard let obj = processObject(for: pid) else {
+                trace("tap probe[mini]: done — pid \(pid) has no CoreAudio process object"); completion(); return
+            }
+            desc = CATapDescription(stereoMixdownOfProcesses: [obj])
+            trace("tap probe: mini engine — mute-tapping only pid \(pid) (object \(obj)) and re-playing it")
+        }
         desc.name = "Faded tap probe"
         desc.isPrivate = true
-        if mode == "full" { desc.muteBehavior = CATapMuteBehavior(rawValue: 1)! }   // CATapMuted
+        if mode == "full" || mode == "mini" { desc.muteBehavior = CATapMuteBehavior(rawValue: 1)! }   // CATapMuted
 
         var tap = AudioObjectID(kAudioObjectUnknown)
         var st: OSStatus = noErr
@@ -156,8 +185,11 @@ enum TapProbe {
             kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: dev.uid]],
         ]
         if mode != "notap" {
-            aggDesc[kAudioAggregateDeviceTapListKey] = [[kAudioSubTapDriftCompensationKey: true,
+            // FADED_PROBE_DRIFT=0 builds the aggregate the way the engine does.
+            let drift = ProcessInfo.processInfo.environment["FADED_PROBE_DRIFT"] != "0"
+            aggDesc[kAudioAggregateDeviceTapListKey] = [[kAudioSubTapDriftCompensationKey: drift,
                                                           kAudioSubTapUIDKey: desc.uuid.uuidString]]
+            trace("tap probe: sub-tap drift compensation \(drift)")
         }
         var agg = AudioObjectID(kAudioObjectUnknown)
         st = AudioHardwareCreateAggregateDevice(aggDesc as CFDictionary, &agg)
@@ -173,7 +205,7 @@ enum TapProbe {
         trace("tap probe: aggregate rate \(rate) Hz")
 
         let stats = TapProbeStats()
-        stats.passThrough = (mode == "full" || mode == "unmuted")   // "global", "only", "excluding" just listen
+        stats.passThrough = (mode == "full" || mode == "unmuted" || mode == "mini")   // the rest just listen
         stats.phaseStep = 2 * Double.pi * toneHz / rate
         var procID: AudioDeviceIOProcID?
         let ioQueue = DispatchQueue(label: "com.andri.faded.tapprobe.io", qos: .userInteractive)
@@ -195,7 +227,7 @@ enum TapProbe {
                 if let p = procID { AudioDeviceDestroyIOProcID(agg, p) }
                 AudioHardwareDestroyAggregateDevice(agg)
                 if tap != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tap) }
-                trace(String(format: "tap probe[%@]: done cycles=%d peak=%.5f rms=%.5f tone1k=%.5f in=[%@] out=[%@] deviceInputsDelivered=%d deviceInputPeak=%.5f",
+                trace(String(format: "tap probe[%@]: done cycles=%d peak=%.5f rms=%.5f tone=%.5f in=[%@] out=[%@] deviceInputsDelivered=%d deviceInputPeak=%.5f",
                              mode, stats.cycles, stats.peak, stats.rms, stats.tone, stats.inDesc, stats.outDesc,
                              stats.deviceInputBuffersWithData, stats.deviceInputPeak))
                 completion()
